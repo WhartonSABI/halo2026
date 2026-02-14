@@ -16,9 +16,9 @@ Outcomes:
   stopped (whistle, goal, icing, offside)
 
 Output files:
-- forechecks.csv: one row per forecheck, with outcome and labels
-- forecheck_events.csv: events that fall within a forecheck
-- forecheck_tracking.csv: tracking (player positions) for events within forechecks
+- forechecks.parquet: one row per forecheck, with outcome and labels
+- forecheck_events.parquet: events that fall within a forecheck
+- forecheck_tracking.parquet: tracking (player positions) for events within forechecks
 """
 
 from pathlib import Path
@@ -223,17 +223,17 @@ def main() -> None:
     tracking_fc = get_forecheck_tracking(tracking, events_with_fc)
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)
-    forechecks.to_csv(OUT_DIR / "forechecks.csv", index=False)
-    events_with_fc.to_csv(OUT_DIR / "forecheck_events.csv", index=False)
-    tracking_fc.to_csv(OUT_DIR / "forecheck_tracking.csv", index=False)
+    forechecks.to_parquet(OUT_DIR / "forechecks.parquet", index=False)
+    events_with_fc.to_parquet(OUT_DIR / "forecheck_events.parquet", index=False)
+    tracking_fc.to_parquet(OUT_DIR / "forecheck_tracking.parquet", index=False)
 
     # Print summary
     n_fc = len(forechecks)
     n_success = forechecks["y"].sum()
     print(f"Built {n_fc} forecheck sequences ({n_success} success, {n_fc - n_success} failure)")
-    print(f"  Written: {OUT_DIR / 'forechecks.csv'}")
-    print(f"  Written: {OUT_DIR / 'forecheck_events.csv'}")
-    print(f"  Written: {OUT_DIR / 'forecheck_tracking.csv'}")
+    print(f"  Written: {OUT_DIR / 'forechecks.parquet'}")
+    print(f"  Written: {OUT_DIR / 'forecheck_events.parquet'}")
+    print(f"  Written: {OUT_DIR / 'forecheck_tracking.parquet'}")
 
 
 if __name__ == "__main__":
