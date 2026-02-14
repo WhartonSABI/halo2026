@@ -8,8 +8,11 @@
 # jp
 jp
 
-# private data
-*.parquet
+# large raw data
+data/raw
+
+# tracking
+*tracking.csv
 
 # tex files
 *.tex
