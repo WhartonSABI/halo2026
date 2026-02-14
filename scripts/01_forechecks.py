@@ -18,6 +18,7 @@ Outcomes:
 Output files:
 - forechecks.csv: one row per forecheck, with outcome and labels
 - forecheck_events.csv: events that fall within a forecheck
+- forecheck_tracking.csv: tracking (player positions) for events within forechecks
 """
 
 from pathlib import Path
@@ -48,6 +49,10 @@ def load_events(data_dir: Path) -> pd.DataFrame:
 
 def load_games(data_dir: Path) -> pd.DataFrame:
     return pd.read_parquet(data_dir / "games.parquet")
+
+
+def load_tracking(data_dir: Path) -> pd.DataFrame:
+    return pd.read_parquet(data_dir / "tracking.parquet")
 
 
 #######################
@@ -189,6 +194,18 @@ def get_forecheck_events(
     return events_with_fc.reset_index(drop=True)
 
 
+def get_forecheck_tracking(
+    tracking: pd.DataFrame, forecheck_events: pd.DataFrame
+) -> pd.DataFrame:
+    # Inner join: keep only tracking rows for (game_id, sl_event_id) in forechecks
+    fc_event_keys = forecheck_events[["game_id", "sl_event_id", "fc_sequence_id"]].drop_duplicates()
+    return tracking.merge(
+        fc_event_keys,
+        on=["game_id", "sl_event_id"],
+        how="inner",
+    )
+
+
 ############
 ### MAIN ###
 ############
@@ -198,14 +215,17 @@ def main() -> None:
     data_dir = DATA_DIR
     events = load_events(data_dir)
     games = load_games(data_dir)
+    tracking = load_tracking(data_dir)
 
     # Build forechecks and extract only forecheck events
     forechecks = build_forecheck_sequences(events)
     events_with_fc = get_forecheck_events(events, forechecks)
+    tracking_fc = get_forecheck_tracking(tracking, events_with_fc)
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     forechecks.to_csv(OUT_DIR / "forechecks.csv", index=False)
     events_with_fc.to_csv(OUT_DIR / "forecheck_events.csv", index=False)
+    tracking_fc.to_csv(OUT_DIR / "forecheck_tracking.csv", index=False)
 
     # Print summary
     n_fc = len(forechecks)
@@ -213,6 +233,7 @@ def main() -> None:
     print(f"Built {n_fc} forecheck sequences ({n_success} success, {n_fc - n_success} failure)")
     print(f"  Written: {OUT_DIR / 'forechecks.csv'}")
     print(f"  Written: {OUT_DIR / 'forecheck_events.csv'}")
+    print(f"  Written: {OUT_DIR / 'forecheck_tracking.csv'}")
 
 
 if __name__ == "__main__":
