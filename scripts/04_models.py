@@ -19,7 +19,8 @@ Key modeling choice:
 Player crediting logic (value of a press):
 - For each hazard row, define press value = P(success) - P(failure).
 - For each forechecker slot F1..F5, compute a leave-one-out counterfactual by
-  neutralizing that slot's pressure/lane features and removing the player ID.
+  removing the slot player ID and replacing slot pressure/lane features with
+  contextual medians (same manpower/score/time-bin context when possible).
 - Slot credit on the row is the drop in press value under this counterfactual.
   Positive credit means that player's pressure increased expected success
   relative to failure.
@@ -168,29 +169,39 @@ def evaluate_model(name: str, model: Pipeline, X_test: pd.DataFrame, y_test: pd.
     }
 
 
-def neutralize_slot_features(df: pd.DataFrame, slot: str) -> pd.DataFrame:
-    """Create leave-one-out counterfactual features for a forechecker slot."""
+def contextual_median_slot_replacement(df: pd.DataFrame, slot: str) -> pd.DataFrame:
+    """Counterfactual: remove slot identity and replace slot features by contextual medians."""
     cf = df.copy()
 
-    # Remove identity for categorical player effect.
     slot_id = f"{slot}_id"
     if slot_id in cf.columns:
         cf[slot_id] = np.nan
 
-    # Neutralize direct pressure and lane-block impact from this slot.
-    neutral_map = {
-        f"{slot}_r": 99.0,
-        f"{slot}_vr_carrier": 0.0,
-        f"{slot}_sinθ": 0.0,
-        f"{slot}_cosθ": 0.0,
-        f"{slot}_block_severity": 0.0,
-        f"{slot}_block_center_severity": 0.0,
-        f"{slot}_r_nearestOpp": 99.0,
-        f"{slot}_vr_nearestOpp": 0.0,
-    }
-    for col, val in neutral_map.items():
-        if col in cf.columns:
-            cf[col] = val
+    slot_cols = [
+        f"{slot}_r",
+        f"{slot}_vr_carrier",
+        f"{slot}_sinθ",
+        f"{slot}_cosθ",
+        f"{slot}_block_severity",
+        f"{slot}_block_center_severity",
+        f"{slot}_r_nearestOpp",
+        f"{slot}_vr_nearestOpp",
+    ]
+
+    context_candidates = ["manpower_state", "score_diff_bin", "time_since_start_bin"]
+    context_cols = [c for c in context_candidates if c in df.columns]
+
+    for col in slot_cols:
+        if col not in cf.columns:
+            continue
+
+        if context_cols:
+            contextual = df.groupby(context_cols, dropna=False)[col].transform("median")
+            replacement = contextual.fillna(df[col].median())
+        else:
+            replacement = pd.Series(df[col].median(), index=df.index)
+
+        cf[col] = replacement
 
     return cf
 
@@ -210,7 +221,7 @@ def build_player_press_credit(
         if slot_id not in source_df.columns:
             continue
 
-        cf_features = neutralize_slot_features(X_source, slot)
+        cf_features = contextual_median_slot_replacement(X_source, slot)
         cf_proba = model.predict_proba(cf_features)
         cf_press_value = cf_proba[:, 1] - cf_proba[:, 2]
 
