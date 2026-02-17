@@ -2,6 +2,9 @@
 ### FILES & DIRECTORIES ###
 ###########################
 
+# old files
+archived
+
 # finder
 *.DS_Store
 
