@@ -124,3 +124,28 @@ One record per player per event. Player positions at the moment of each event. N
 | `tracking_y` | Y position on ice |
 | `tracking_vel_x` | X velocity (if available) |
 | `tracking_vel_y` | Y velocity (if available) |
+
+---
+
+## Processed: forechecks
+
+Output of `scripts/01_forechecks.py`; written to `data/processed/forechecks.parquet`. One record per forecheck sequence. **Outcome rules (success, failure, dropped):** see README § Forecheck outcomes.
+
+| Field | Description |
+|-------|-------------|
+| `fc_sequence_id` | Row index |
+| `game_id` | Game |
+| `period` | Period (at dump-in) |
+| `period_time` | Period time at dump-in (seconds) |
+| `sequence_id` | Event sequence (faceoff-to-whistle) |
+| `sl_event_id_start` | Event id of first LPR under pressure (sequence start) |
+| `sl_event_id_end` | Event id of terminal event |
+| `pressing_team_id` | Team applying forecheck (Team A) |
+| `defending_team_id` | Team in possession after dump-in (Team B) |
+| `dumpin_detail` | dump / chip |
+| `lpr_detail` | LPR subtype (opdump, hipresopdump, etc.) |
+| `puck_x_at_start`, `puck_y_at_start` | Puck location at sequence start |
+| `sign_negative` | True if puck in negative-x zone (used for flip) |
+| `outcome` | `"success"` or `"failure"` |
+| `y` | 1 = success, 0 = failure |
+| `terminal_event_type` | Event that ended the sequence (e.g. zone_exit, lpr, possession, whistle, goal, penalty) |

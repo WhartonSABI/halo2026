@@ -204,10 +204,13 @@ def _save_press_gif(
     out_path: Path,
     title_prefix: str = "",
     interval_ms: int = 350,
+    x_min: float | None = None,
 ) -> None:
     """Animate a single forecheck and save to GIF."""
     fig, ax = plt.subplots(figsize=(12, 6))
     draw_rink(ax)
+    if x_min is not None:
+        ax.set_xlim(x_min, RINK_X[1] + 5)
 
     player_scatter = ax.scatter([], [], c="gray", s=60, alpha=0.7, label="Players", zorder=2)
     puck_scatter = ax.scatter([], [], s=200, marker="o", edgecolors="white", linewidths=2, zorder=3)
@@ -277,7 +280,7 @@ def save_longest_presses(interval_ms: int = 350) -> None:
     ]:
         ev = fc_events[fc_events["fc_sequence_id"] == fc_id].sort_values("sl_event_id").reset_index(drop=True)
         tr = fc_tracking[fc_tracking["fc_sequence_id"] == fc_id]
-        _save_press_gif(ev, tr, PLOTS_DIR / f"{name}.gif", title_prefix=title, interval_ms=interval_ms)
+        _save_press_gif(ev, tr, PLOTS_DIR / f"{name}.gif", title_prefix=title, interval_ms=interval_ms, x_min=-40)
 
 
 def main() -> None:

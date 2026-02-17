@@ -5,7 +5,9 @@ Build forecheck (pressing) sequences from hockey event data.
 Logic:
   1. Start: dump-in → LPR+ under pressure (Team B recovers).
   2. Success: Team A gets possession before puck exits zone.
-  3. Loss: puck exits or stoppage before Team A gets it.
+  3. Failure: puck exits or stoppage before Team A gets it.
+  4. Penalty on pressing team → failure; penalty on defending team (possession) → success.
+  5. Period-end whistle → dropped (not success or failure).
 """
 
 from pathlib import Path
@@ -22,9 +24,14 @@ DATA_DIR = PROJECT_ROOT / "data" / "raw"
 OUT_DIR = PROJECT_ROOT / "data" / "processed"
 
 LPR_UNDER_PRESSURE = ("opdump", "opdumpcontested", "hipresopdump", "hipresopdumpcontested", "contested")
-STOPPAGE = ("whistle", "goal", "icing", "offside")
+# Stoppage event_types (other whistles): whistle (generic, e.g. puck out of play; period-end dropped),
+# goal, icing, offside, penalty (outcome set by which team took the penalty)
+STOPPAGE = ("whistle", "goal", "icing", "offside", "penalty")
 POSSESSION_EVENTS = ("lpr", "reception", "carry", "pass", "dumpin", "shot")
 BLUE_LINE = 25
+# Period length (sec) for detecting period-end whistle: regulation 1200, OT often 300
+REGULATION_PERIOD_LENGTH = 1200.0
+OT_PERIOD_LENGTH = 300.0
 
 
 #################
@@ -79,7 +86,7 @@ def build_forecheck_sequences(events: pd.DataFrame) -> pd.DataFrame:
     starts["sign_negative"] = starts["puck_x_at_start"] < 0
 
     # 3. Vectorized scan: for each start, find first terminal event (stoppage, zone exit, or Team A possession)
-    ev_cols = ["game_id", "sequence_id", "sl_event_id", "event_type", "team_id", "x"]
+    ev_cols = ["game_id", "sequence_id", "sl_event_id", "event_type", "team_id", "x", "period", "period_time"]
     scan = events[ev_cols].merge(
         starts[["game_id", "sequence_id", "sl_event_id_start", "sl_event_id_dumpin", "pressing_team_id", "sign_negative"]],
         on=["game_id", "sequence_id"],
@@ -108,6 +115,18 @@ def build_forecheck_sequences(events: pd.DataFrame) -> pd.DataFrame:
         "failure",
         np.where(is_zone_exit.loc[first_term.index], "failure", "success"),
     )
+    # Need defending_team_id for penalty outcome
+    first_term = first_term.merge(
+        starts[["game_id", "sequence_id", "sl_event_id_dumpin", "defending_team_id"]],
+        on=["game_id", "sequence_id", "sl_event_id_dumpin"],
+        how="left",
+    )
+    # Penalty: pressing team took penalty -> failure; defending team (possession) took penalty -> success
+    is_penalty = first_term["event_type"] == "penalty"
+    penalty_on_pressing = is_penalty & (first_term["team_id"] == first_term["pressing_team_id"])
+    penalty_on_defending = is_penalty & (first_term["team_id"] == first_term["defending_team_id"])
+    first_term.loc[penalty_on_pressing, "outcome"] = "failure"
+    first_term.loc[penalty_on_defending, "outcome"] = "success"
     first_term["y"] = (first_term["outcome"] == "success").astype(int)
     first_term["terminal_event_type"] = np.where(
         is_stoppage.loc[first_term.index],
@@ -115,10 +134,19 @@ def build_forecheck_sequences(events: pd.DataFrame) -> pd.DataFrame:
         np.where(is_zone_exit.loc[first_term.index], "zone_exit", np.where(first_term["event_type"] == "lpr", "lpr", "possession")),
     )
 
+    # Drop period-end whistles (do not count as success or failure)
+    max_pt = events.groupby(["game_id", "period"])["period_time"].max().reset_index().rename(columns={"period_time": "max_period_time"})
+    first_term = first_term.merge(max_pt, on=["game_id", "period"], how="left")
+    period_end_whistle = (
+        (first_term["event_type"] == "whistle")
+        & (first_term["period_time"] >= first_term["max_period_time"] - 1.0)
+    )
+    first_term = first_term.loc[~period_end_whistle].drop(columns=["max_period_time"])
+
     fc = (
         first_term
         .merge(
-            starts[["game_id", "sequence_id", "sl_event_id_dumpin", "period", "period_time", "defending_team_id", "dumpin_detail", "lpr_detail", "puck_x_at_start", "puck_y_at_start"]],
+            starts[["game_id", "sequence_id", "sl_event_id_dumpin", "period", "period_time", "dumpin_detail", "lpr_detail", "puck_x_at_start", "puck_y_at_start"]],
             on=["game_id", "sequence_id", "sl_event_id_dumpin"],
             how="left",
         )
