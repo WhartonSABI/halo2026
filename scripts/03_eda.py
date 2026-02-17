@@ -264,6 +264,68 @@ def _save_press_gif(
     print(f"Saved: {out_path}")
 
 
+#####################################
+### POSSESSION TIME VS RECOVERY ###
+#####################################
+
+def possession_time_vs_recovery() -> None:
+    """Does length of possession (time or event count) correlate with recovery rate?"""
+    events = load_events(DATA_DIR)
+    forechecks = pd.read_parquet(PROCESSED_DIR / "forechecks.parquet")
+
+    start_times = (
+        events[["game_id", "sl_event_id", "period", "period_time"]]
+        .rename(columns={"sl_event_id": "sl_event_id_start", "period_time": "period_time_start", "period": "period_start"})
+    )
+    end_times = (
+        events[["game_id", "sl_event_id", "period", "period_time"]]
+        .rename(columns={"sl_event_id": "sl_event_id_end", "period_time": "period_time_end", "period": "period_end"})
+    )
+    fc = (
+        forechecks
+        .merge(start_times, on=["game_id", "sl_event_id_start"])
+        .merge(end_times, on=["game_id", "sl_event_id_end"])
+    )
+    same_period = fc["period_start"] == fc["period_end"]
+    fc = fc.loc[same_period].copy()
+    fc["duration_sec"] = fc["period_time_end"].astype(float) - fc["period_time_start"].astype(float)
+    fc["event_count"] = fc["sl_event_id_end"] - fc["sl_event_id_start"]
+
+    r_time = fc["duration_sec"].corr(fc["y"])
+    r_events = fc["event_count"].corr(fc["y"])
+    print("Correlation with recovery (y):")
+    print(f"  duration_sec:  {r_time:.4f}")
+    print(f"  event_count:  {r_events:.4f}")
+
+    max_sec = float(fc["duration_sec"].max())
+    duration_edges = [0, 5, 10, 15, 20, 30, 60, max(61, max_sec + 0.01)]
+    fc["duration_bin"] = pd.cut(
+        fc["duration_sec"],
+        bins=duration_edges,
+        labels=["0-5s", "5-10s", "10-15s", "15-20s", "20-30s", "30-60s", "60s+"],
+    )
+    by_duration = fc.groupby("duration_bin", observed=True).agg(
+        n=("y", "count"),
+        recovery_rate=("y", "mean"),
+    ).round(4)
+    print("\nRecovery rate by possession length (seconds):")
+    print(by_duration)
+
+    max_ev = int(fc["event_count"].max())
+    event_edges = [0, 5, 10, 20, 50, 100, max(101, max_ev + 1)]
+    fc["event_bin"] = pd.cut(
+        fc["event_count"],
+        bins=event_edges,
+        labels=["1-5", "6-10", "11-20", "21-50", "51-100", "100+"],
+    )
+    by_events = fc.groupby("event_bin", observed=True).agg(
+        n=("y", "count"),
+        recovery_rate=("y", "mean"),
+    ).round(4)
+    print("\nRecovery rate by event count in sequence:")
+    print(by_events)
+
+
 def save_longest_presses(interval_ms: int = 350) -> None:
     """Save longest successful press (long_success.gif) and longest failure (long_failure.gif)."""
     forechecks = pd.read_parquet(PROCESSED_DIR / "forechecks.parquet")
@@ -284,6 +346,7 @@ def save_longest_presses(interval_ms: int = 350) -> None:
 
 
 def main() -> None:
+    possession_time_vs_recovery()
     save_longest_presses(interval_ms=350)
 
 
