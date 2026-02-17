@@ -47,6 +47,8 @@ from sklearn.ensemble import HistGradientBoostingClassifier
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DATA_PATH = PROJECT_ROOT / "data" / "processed" / "hazard_features.parquet"
 OUT_DIR = PROJECT_ROOT / "data" / "processed"
+RESULTS_DIR = PROJECT_ROOT / "data" / "results"
+RAW_DIR = PROJECT_ROOT / "data" / "raw"
 
 RANDOM_STATE = 7
 FORECHECK_SLOTS = ["F1", "F2", "F3", "F4", "F5"]
@@ -303,6 +305,7 @@ def build_player_press_credit(
         per_row.groupby("player_id", as_index=False)
         .agg(
             n_rows=("total_press_credit", "size"),
+            n_presses=("fc_sequence_id", "nunique"),
             total_start_positioning_credit=("start_positioning_credit", "sum"),
             avg_start_positioning_credit=("start_positioning_credit", "mean"),
             total_execution_credit=("execution_credit", "sum"),
@@ -313,6 +316,32 @@ def build_player_press_credit(
         .sort_values("total_press_credit", ascending=False)
     )
     return summary
+
+
+def _write_clean_csv(credit: pd.DataFrame, out_path: Path) -> None:
+    """Write clean CSV: player_id, player_name, position, n_presses, n_rows, start_positioning, execution, total."""
+    players_df = pd.read_parquet(RAW_DIR / "players.parquet")
+    pid_col = "player_id" if "player_id" in players_df.columns else "id"
+    name_col = "player_name" if "player_name" in players_df.columns else "name"
+    pos_col = "primary_position" if "primary_position" in players_df.columns else "position"
+    merge_cols = {pid_col: "player_id", name_col: "player_name"}
+    if pos_col in players_df.columns:
+        merge_cols[pos_col] = "position"
+    out = credit[["player_id", "n_rows", "n_presses", "total_start_positioning_credit", "total_execution_credit"]].copy()
+    out = out.rename(columns={
+        "total_start_positioning_credit": "start_positioning",
+        "total_execution_credit": "execution",
+    })
+    out["total"] = out["start_positioning"] + out["execution"]
+    out = out.sort_values("total", ascending=False).reset_index(drop=True)
+    out = out.merge(
+        players_df[[c for c in [pid_col, name_col, pos_col] if c in players_df.columns]].rename(columns=merge_cols),
+        on="player_id",
+        how="left",
+    )
+    out_cols = ["player_id", "player_name", "position", "n_presses", "n_rows", "start_positioning", "execution", "total"]
+    out = out[[c for c in out_cols if c in out.columns]]
+    out.to_csv(out_path, index=False)
 
 
 def main() -> None:
@@ -368,18 +397,19 @@ def main() -> None:
 
     summary = pd.DataFrame(rows).sort_values("log_loss")
     OUT_DIR.mkdir(parents=True, exist_ok=True)
-    out_path = OUT_DIR / "hazard_model_summary.csv"
+    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    out_path = RESULTS_DIR / "model_summary.csv"
     summary.to_csv(out_path, index=False)
 
     # Build player-level press value credits from best model on held-out rows.
     best_model_name = summary.iloc[0]["model"]
     best_model = fitted_models[best_model_name]
     player_credit = build_player_press_credit(best_model, test_df, X_test)
-    player_out = OUT_DIR / "player_press_credit.csv"
-    player_credit.to_csv(player_out, index=False)
+    model_out = RESULTS_DIR / "modeling.csv"
+    _write_clean_csv(player_credit, model_out)
 
     print("\nSaved model summary:", out_path)
-    print("Saved player press credit:", player_out)
+    print("Saved modeling ranking:", model_out)
     print(summary)
 
 
