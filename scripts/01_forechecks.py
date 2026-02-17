@@ -61,7 +61,7 @@ def build_forecheck_sequences(events: pd.DataFrame) -> pd.DataFrame:
             & (events["outcome"] == "successful")
             & (events["detail"].isin(LPR_UNDER_PRESSURE))
         ]
-        [["game_id", "sequence_id", "sl_event_id", "team_id", "x", "detail"]]
+        [["game_id", "sequence_id", "sl_event_id", "team_id", "x", "y", "detail"]]
         .rename(columns={"sl_event_id": "sl_event_id_lpr", "detail": "lpr_detail"})
     )
 
@@ -75,6 +75,7 @@ def build_forecheck_sequences(events: pd.DataFrame) -> pd.DataFrame:
     starts = starts.rename(columns={"sl_event_id": "sl_event_id_dumpin"})
     starts["sl_event_id_start"] = starts["sl_event_id_lpr"]
     starts["puck_x_at_start"] = starts["x"]
+    starts["puck_y_at_start"] = starts["y"]
     starts["sign_negative"] = starts["puck_x_at_start"] < 0
 
     # 3. Vectorized scan: for each start, find first terminal event (stoppage, zone exit, or Team A possession)
@@ -117,12 +118,12 @@ def build_forecheck_sequences(events: pd.DataFrame) -> pd.DataFrame:
     fc = (
         first_term
         .merge(
-            starts[["game_id", "sequence_id", "sl_event_id_dumpin", "period", "period_time", "defending_team_id", "dumpin_detail", "lpr_detail", "puck_x_at_start"]],
+            starts[["game_id", "sequence_id", "sl_event_id_dumpin", "period", "period_time", "defending_team_id", "dumpin_detail", "lpr_detail", "puck_x_at_start", "puck_y_at_start"]],
             on=["game_id", "sequence_id", "sl_event_id_dumpin"],
             how="left",
         )
         .rename(columns={"sl_event_id": "sl_event_id_end"})
-        [["game_id", "period", "period_time", "sequence_id", "sl_event_id_start", "sl_event_id_end", "pressing_team_id", "defending_team_id", "dumpin_detail", "lpr_detail", "puck_x_at_start", "sign_negative", "outcome", "y", "terminal_event_type"]]
+        [["game_id", "period", "period_time", "sequence_id", "sl_event_id_start", "sl_event_id_end", "pressing_team_id", "defending_team_id", "dumpin_detail", "lpr_detail", "puck_x_at_start", "puck_y_at_start", "sign_negative", "outcome", "y", "terminal_event_type"]]
     )
     fc.insert(0, "fc_sequence_id", range(len(fc)))
     return fc
@@ -142,6 +143,40 @@ def get_forecheck_tracking(tracking: pd.DataFrame, forecheck_events: pd.DataFram
     return tracking.merge(keys, on=["game_id", "sl_event_id"], how="inner")
 
 
+def flip_xy_for_negative_x(
+    forechecks: pd.DataFrame,
+    events: pd.DataFrame,
+    tracking: pd.DataFrame,
+    x_threshold: float = -25,
+) -> None:
+    """For plays where puck_x_at_start < x_threshold, negate x and y so all forechecks share the same orientation."""
+    flip_mask = forechecks["puck_x_at_start"].astype(float) < x_threshold
+    flip_fc_ids = forechecks.loc[flip_mask, "fc_sequence_id"].values
+    fc_flip = forechecks["fc_sequence_id"].isin(flip_fc_ids)
+
+    # Forechecks: negate puck_x_at_start and puck_y_at_start
+    forechecks.loc[fc_flip, "puck_x_at_start"] = -forechecks.loc[fc_flip, "puck_x_at_start"].astype(float)
+    forechecks.loc[fc_flip, "puck_y_at_start"] = -forechecks.loc[fc_flip, "puck_y_at_start"].astype(float)
+    forechecks.loc[fc_flip, "sign_negative"] = forechecks.loc[fc_flip, "puck_x_at_start"].astype(float) < 0
+
+    # Events: negate x and y
+    if "fc_sequence_id" in events.columns and "x" in events.columns and "y" in events.columns:
+        ev_flip = events["fc_sequence_id"].isin(flip_fc_ids)
+        events.loc[ev_flip, "x"] = -events.loc[ev_flip, "x"].astype(float)
+        events.loc[ev_flip, "y"] = -events.loc[ev_flip, "y"].astype(float)
+
+    # Tracking: negate tracking_x, tracking_y, and velocities if present
+    if "fc_sequence_id" in tracking.columns:
+        tr_flip = tracking["fc_sequence_id"].isin(flip_fc_ids)
+        if "tracking_x" in tracking.columns and "tracking_y" in tracking.columns:
+            tracking.loc[tr_flip, "tracking_x"] = -tracking.loc[tr_flip, "tracking_x"].astype(float)
+            tracking.loc[tr_flip, "tracking_y"] = -tracking.loc[tr_flip, "tracking_y"].astype(float)
+        for vx, vy in [("tracking_vel_x", "tracking_vel_y")]:
+            if vx in tracking.columns and vy in tracking.columns:
+                tracking.loc[tr_flip, vx] = -tracking.loc[tr_flip, vx].astype(float)
+                tracking.loc[tr_flip, vy] = -tracking.loc[tr_flip, vy].astype(float)
+
+
 ############
 ### MAIN ###
 ############
@@ -154,6 +189,9 @@ def main() -> None:
     forechecks = build_forecheck_sequences(events)
     events_with_fc = get_forecheck_events(events, forechecks)
     tracking_fc = get_forecheck_tracking(tracking, events_with_fc)
+
+    # For plays where x < -25, flip x and y so all forechecks share the same orientation.
+    flip_xy_for_negative_x(forechecks, events_with_fc, tracking_fc, x_threshold=-25)
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     forechecks.to_parquet(OUT_DIR / "forechecks.parquet", index=False)
