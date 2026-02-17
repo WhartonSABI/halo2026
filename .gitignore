@@ -12,7 +12,7 @@ archived
 jp
 
 # large raw data
-data/raw
+data/raw/tracking.parquet
 
 # tracking
 *tracking.csv
