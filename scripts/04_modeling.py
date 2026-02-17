@@ -211,9 +211,39 @@ def build_player_press_credit(
     source_df: pd.DataFrame,
     X_source: pd.DataFrame,
 ) -> pd.DataFrame:
-    """Estimate player-level value of press via leave-one-out slot counterfactuals."""
+    """Estimate player-level press value and split into start-state vs execution credit.
+
+    Decomposition for each row follows:
+    - start_positioning_credit: effect on sequence-start press value
+    - execution_credit: remaining effect beyond sequence start
+    - total_press_credit: start_positioning_credit + execution_credit
+    """
     base_proba = model.predict_proba(X_source)
     base_press_value = base_proba[:, 1] - base_proba[:, 2]
+
+    # Identify sequence-start row (earliest elapsed time; tie-break by event id).
+    ordering = pd.DataFrame(
+        {
+            "fc_sequence_id": source_df["fc_sequence_id"].values,
+            "time_since_start_s": X_source["time_since_start_s"].astype(float).values,
+            "sl_event_id": source_df["sl_event_id"].values,
+        },
+        index=source_df.index,
+    )
+    start_rows = (
+        ordering.sort_values(["fc_sequence_id", "time_since_start_s", "sl_event_id"])
+        .groupby("fc_sequence_id", as_index=False)
+        .first()[["fc_sequence_id", "time_since_start_s", "sl_event_id"]]
+    )
+    start_index = (
+        ordering.reset_index()
+        .merge(start_rows, on=["fc_sequence_id", "time_since_start_s", "sl_event_id"], how="inner")
+        .drop_duplicates(subset=["fc_sequence_id"])
+        .set_index("fc_sequence_id")["index"]
+    )
+
+    base_start_by_seq = pd.Series(base_press_value, index=source_df.index).loc[start_index.values]
+    base_start_by_seq.index = start_index.index
 
     credit_rows: list[pd.DataFrame] = []
     for slot in FORECHECK_SLOTS:
@@ -225,33 +255,60 @@ def build_player_press_credit(
         cf_proba = model.predict_proba(cf_features)
         cf_press_value = cf_proba[:, 1] - cf_proba[:, 2]
 
-        slot_credit = base_press_value - cf_press_value
+        cf_start_by_seq = pd.Series(cf_press_value, index=source_df.index).loc[start_index.values]
+        cf_start_by_seq.index = start_index.index
+
+        total_credit = base_press_value - cf_press_value
+
+        base_start_aligned = source_df["fc_sequence_id"].map(base_start_by_seq).to_numpy(dtype=float)
+        cf_start_aligned = source_df["fc_sequence_id"].map(cf_start_by_seq).to_numpy(dtype=float)
+        start_positioning_credit = base_start_aligned - cf_start_aligned
+        execution_credit = total_credit - start_positioning_credit
+
         slot_frame = pd.DataFrame(
             {
                 "player_id": source_df[slot_id].values,
                 "fc_sequence_id": source_df["fc_sequence_id"].values,
                 "sl_event_id": source_df["sl_event_id"].values,
                 "slot": slot,
-                "press_credit": slot_credit,
+                "start_positioning_credit": start_positioning_credit,
+                "execution_credit": execution_credit,
+                "total_press_credit": total_credit,
             }
         )
         slot_frame = slot_frame.dropna(subset=["player_id"])
         credit_rows.append(slot_frame)
 
     if not credit_rows:
-        return pd.DataFrame(columns=["player_id", "n_rows", "total_press_credit", "avg_press_credit"])
+        return pd.DataFrame(
+            columns=[
+                "player_id",
+                "n_rows",
+                "total_start_positioning_credit",
+                "avg_start_positioning_credit",
+                "total_execution_credit",
+                "avg_execution_credit",
+                "total_press_credit",
+                "avg_press_credit",
+            ]
+        )
 
     per_row = pd.concat(credit_rows, ignore_index=True)
 
     # Optional cap to stabilize occasional extreme counterfactual deltas.
-    per_row["press_credit"] = per_row["press_credit"].clip(lower=-1.0, upper=1.0)
+    for col in ["start_positioning_credit", "execution_credit", "total_press_credit"]:
+        per_row[col] = per_row[col].clip(lower=-1.0, upper=1.0)
 
     summary = (
         per_row.groupby("player_id", as_index=False)
         .agg(
-            n_rows=("press_credit", "size"),
-            total_press_credit=("press_credit", "sum"),
-            avg_press_credit=("press_credit", "mean"),
+            n_rows=("total_press_credit", "size"),
+            total_start_positioning_credit=("start_positioning_credit", "sum"),
+            avg_start_positioning_credit=("start_positioning_credit", "mean"),
+            total_execution_credit=("execution_credit", "sum"),
+            avg_execution_credit=("execution_credit", "mean"),
+            total_press_credit=("total_press_credit", "sum"),
+            avg_press_credit=("total_press_credit", "mean"),
         )
         .sort_values("total_press_credit", ascending=False)
     )
