@@ -175,6 +175,7 @@ def _process_one_frame(r, frame: pd.DataFrame) -> dict | None:
     rel_to_carrier = fc_xy - carrier_xy_arr
     dist_to_carrier = np.linalg.norm(rel_to_carrier, axis=1, keepdims=True)
     np.putmask(dist_to_carrier, dist_to_carrier < 1e-9, 1.0)
+    unit_to_carrier = rel_to_carrier / dist_to_carrier
     vr_carrier = _radial_closing_speed_batch(fc_xy, fc_v, np.broadcast_to(carrier_xy_arr, (n_fc, 2)))
 
     for i in range(1, 6):
@@ -182,18 +183,14 @@ def _process_one_frame(r, frame: pd.DataFrame) -> dict | None:
             feat[f"F{i}_id"] = forecheckers.iloc[i - 1]["player_id"]
             feat[f"F{i}_r"] = float(dist_to_carrier[i - 1, 0])
             feat[f"F{i}_vr_carrier"] = float(vr_carrier[i - 1])
-            feat[f"F{i}_dx"] = float(rel_to_carrier[i - 1, 0])
-            feat[f"F{i}_dy"] = float(rel_to_carrier[i - 1, 1])
-            feat[f"F{i}_vx"] = float(fc_v[i - 1, 0])
-            feat[f"F{i}_vy"] = float(fc_v[i - 1, 1])
+            feat[f"F{i}_sinθ"] = float(unit_to_carrier[i - 1, 1])
+            feat[f"F{i}_cosθ"] = float(unit_to_carrier[i - 1, 0])
         else:
             feat[f"F{i}_id"] = pd.NA
             feat[f"F{i}_r"] = np.nan
             feat[f"F{i}_vr_carrier"] = np.nan
-            feat[f"F{i}_dx"] = np.nan
-            feat[f"F{i}_dy"] = np.nan
-            feat[f"F{i}_vx"] = np.nan
-            feat[f"F{i}_vy"] = np.nan
+            feat[f"F{i}_sinθ"] = np.nan
+            feat[f"F{i}_cosθ"] = np.nan
 
     opp_skaters = skaters[skaters["team_id"] != r.pressing_team_id]
     opp_xy = opp_skaters[["tracking_x", "tracking_y"]].to_numpy(dtype=float)
@@ -265,14 +262,12 @@ def _process_one_frame(r, frame: pd.DataFrame) -> dict | None:
         feat["unblocked_outlet_count"] = 0
         feat["center_open"] = 0
         feat["min_unblocked_outlet_dist"] = MAX_OUTLET_DIST_FILL
-        feat["unblocked_outlet_frac"] = 0.0
     else:
         unblocked = sorted((lr["distance"] for lr in lane_rows if lr["blocked"] == 0))
         n_unblocked = len(unblocked)
         feat["unblocked_outlet_count"] = n_unblocked
         feat["center_open"] = int(any(lr["center"] and lr["blocked"] == 0 for lr in lane_rows))
         feat["min_unblocked_outlet_dist"] = float(unblocked[0]) if n_unblocked > 0 else MAX_OUTLET_DIST_FILL
-        feat["unblocked_outlet_frac"] = n_unblocked / max(n_lanes, 1)
 
     blocker_stats = {i: {"severity": 0.0, "center_severity": 0.0} for i in range(1, 6)}
     player_to_rank = {forecheckers.iloc[i - 1]["player_id"]: i for i in range(1, n_fc + 1)}
