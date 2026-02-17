@@ -55,14 +55,19 @@ FORECHECK_SLOTS = ["F1", "F2", "F3", "F4", "F5"]
 
 
 class TimeAugmenter:
-    """Simple sklearn-compatible transformer to add time basis features."""
+    """Simple sklearn-compatible transformer to add time basis features.
+
+    Adds log and sqrt transforms of elapsed time so models can capture
+    nonlinear hazard rates (e.g., higher risk early in a sequence).
+    """
 
     def fit(self, X: pd.DataFrame, y: pd.Series | None = None) -> "TimeAugmenter":
+        """No-op: this transformer is stateless."""
         return self
 
     def transform(self, X: pd.DataFrame) -> pd.DataFrame:
         X = X.copy()
-        t = X["time_since_start_s"].astype(float).clip(lower=0.0)
+        t = X["time_since_start_s"].astype(float).clip(lower=0.0)  # avoid log(0)
         X["log_time_since_start_s"] = np.log1p(t)
         X["sqrt_time_since_start_s"] = np.sqrt(t)
         return X
@@ -74,21 +79,24 @@ class TimeAugmenter:
 
 
 def load_data() -> pd.DataFrame:
+    """Load hazard features and define 3-class target: ongoing(0), success(1), failure(2)."""
     df = pd.read_parquet(DATA_PATH)
     y = np.zeros(len(df), dtype=np.int64)
-    y[df["event_t"].eq(1).values] = 1
-    y[df["terminal_failure_t"].eq(1).values] = 2
+    y[df["event_t"].eq(1).values] = 1  # terminal success
+    y[df["terminal_failure_t"].eq(1).values] = 2  # terminal failure
     df["target_class"] = y
     return df
 
 
 def split_groups(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Train/test split by fc_sequence_id. No sequence appears in both sets (prevents leakage)."""
     splitter = GroupShuffleSplit(n_splits=1, test_size=0.2, random_state=RANDOM_STATE)
     tr_idx, te_idx = next(splitter.split(df, groups=df["fc_sequence_id"]))
     return df.iloc[tr_idx].copy(), df.iloc[te_idx].copy()
 
 
 def build_feature_lists(df: pd.DataFrame) -> tuple[list[str], list[str]]:
+    """Partition columns into numeric and categorical, excluding IDs and targets."""
     ignore = {
         "fc_sequence_id",
         "sl_event_id",
@@ -110,6 +118,7 @@ def build_feature_lists(df: pd.DataFrame) -> tuple[list[str], list[str]]:
 
 
 def build_preprocessor(numeric_cols: list[str], cat_cols: list[str]) -> ColumnTransformer:
+    """Build preprocessing pipeline: impute, spline time, scale numerics, one-hot encode categories."""
     time_spline_cols = ["time_since_start_s"]
     numeric_main_cols = [c for c in numeric_cols if c not in time_spline_cols]
 
@@ -148,6 +157,7 @@ def build_preprocessor(numeric_cols: list[str], cat_cols: list[str]) -> ColumnTr
 
 
 def evaluate_model(name: str, model: Pipeline, X_test: pd.DataFrame, y_test: pd.Series) -> dict[str, float]:
+    """Compute log loss, classification report, and mean predicted hazards. Return metrics dict."""
     proba = model.predict_proba(X_test)
     pred = np.argmax(proba, axis=1)
 
@@ -172,13 +182,19 @@ def evaluate_model(name: str, model: Pipeline, X_test: pd.DataFrame, y_test: pd.
 
 
 def contextual_median_slot_replacement(df: pd.DataFrame, slot: str) -> pd.DataFrame:
-    """Counterfactual: remove slot identity and replace slot features by contextual medians."""
+    """Counterfactual: remove slot identity and replace slot features by contextual medians.
+
+    Used for leave-one-out attribution: simulate "this player wasn't here" by replacing
+    their pressure/lane features with the median under the same manpower/score/time context.
+    """
     cf = df.copy()
 
+    # Erase player identity so the model cannot use "who" is in the slot
     slot_id = f"{slot}_id"
     if slot_id in cf.columns:
         cf[slot_id] = np.nan
 
+    # Slot-specific pressure and geometry features to replace
     slot_cols = [
         f"{slot}_r",
         f"{slot}_vr_carrier",
@@ -190,6 +206,7 @@ def contextual_median_slot_replacement(df: pd.DataFrame, slot: str) -> pd.DataFr
         f"{slot}_vr_nearestOpp",
     ]
 
+    # Replace with median within same game context (manpower, score, time bin)
     context_candidates = ["manpower_state", "score_diff_bin", "time_since_start_bin"]
     context_cols = [c for c in context_candidates if c in df.columns]
 
@@ -199,7 +216,7 @@ def contextual_median_slot_replacement(df: pd.DataFrame, slot: str) -> pd.DataFr
 
         if context_cols:
             contextual = df.groupby(context_cols, dropna=False)[col].transform("median")
-            replacement = contextual.fillna(df[col].median())
+            replacement = contextual.fillna(df[col].median())  # fallback if context missing
         else:
             replacement = pd.Series(df[col].median(), index=df.index)
 
@@ -221,9 +238,9 @@ def build_player_press_credit(
     - total_press_credit: start_positioning_credit + execution_credit
     """
     base_proba = model.predict_proba(X_source)
-    base_press_value = base_proba[:, 1] - base_proba[:, 2]
+    base_press_value = base_proba[:, 1] - base_proba[:, 2]  # P(success) - P(failure)
 
-    # Identify sequence-start row (earliest elapsed time; tie-break by event id).
+    # Identify sequence-start row per fc_sequence_id (earliest elapsed time; tie-break by event id)
     ordering = pd.DataFrame(
         {
             "fc_sequence_id": source_df["fc_sequence_id"].values,
@@ -247,6 +264,7 @@ def build_player_press_credit(
     base_start_by_seq = pd.Series(base_press_value, index=source_df.index).loc[start_index.values]
     base_start_by_seq.index = start_index.index
 
+    # For each forechecker slot F1..F5, compute leave-one-out credit
     credit_rows: list[pd.DataFrame] = []
     for slot in FORECHECK_SLOTS:
         slot_id = f"{slot}_id"
@@ -260,8 +278,9 @@ def build_player_press_credit(
         cf_start_by_seq = pd.Series(cf_press_value, index=source_df.index).loc[start_index.values]
         cf_start_by_seq.index = start_index.index
 
-        total_credit = base_press_value - cf_press_value
+        total_credit = base_press_value - cf_press_value  # drop in press value when removing this slot
 
+        # Decompose: start_positioning = effect at sequence start; execution = remainder
         base_start_aligned = source_df["fc_sequence_id"].map(base_start_by_seq).to_numpy(dtype=float)
         cf_start_aligned = source_df["fc_sequence_id"].map(cf_start_by_seq).to_numpy(dtype=float)
         start_positioning_credit = base_start_aligned - cf_start_aligned
@@ -297,10 +316,11 @@ def build_player_press_credit(
 
     per_row = pd.concat(credit_rows, ignore_index=True)
 
-    # Optional cap to stabilize occasional extreme counterfactual deltas.
+    # Cap extreme counterfactual deltas (can occur when model extrapolates)
     for col in ["start_positioning_credit", "execution_credit", "total_press_credit"]:
         per_row[col] = per_row[col].clip(lower=-1.0, upper=1.0)
 
+    # Aggregate row-level credits to player totals and means
     summary = (
         per_row.groupby("player_id", as_index=False)
         .agg(
@@ -319,7 +339,7 @@ def build_player_press_credit(
 
 
 def _write_clean_csv(credit: pd.DataFrame, out_path: Path) -> None:
-    """Write clean CSV: player_id, player_name, position, n_presses, n_rows, start_positioning, execution, total."""
+    """Write human-readable CSV with player names/positions merged from raw player data."""
     players_df = pd.read_parquet(RAW_DIR / "players.parquet")
     pid_col = "player_id" if "player_id" in players_df.columns else "id"
     name_col = "player_name" if "player_name" in players_df.columns else "name"
@@ -345,6 +365,7 @@ def _write_clean_csv(credit: pd.DataFrame, out_path: Path) -> None:
 
 
 def main() -> None:
+    # ---- Data loading and splitting ----
     df = load_data()
     train_df, test_df = split_groups(df)
 
@@ -357,6 +378,7 @@ def main() -> None:
 
     preprocessor = build_preprocessor(numeric_cols, cat_cols)
 
+    # ---- Train competing models ----
     models = {
         "multinomial_logit": LogisticRegression(
             max_iter=1000,
@@ -401,7 +423,7 @@ def main() -> None:
     out_path = RESULTS_DIR / "model_summary.csv"
     summary.to_csv(out_path, index=False)
 
-    # Build player-level press value credits from best model on held-out rows.
+    # ---- Player attribution from best model ----
     best_model_name = summary.iloc[0]["model"]
     best_model = fitted_models[best_model_name]
     player_credit = build_player_press_credit(best_model, test_df, X_test)

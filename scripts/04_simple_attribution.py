@@ -41,7 +41,8 @@ VALUE_COLS = [
 
 
 def _build_sequence_controls(forechecks: pd.DataFrame, events: pd.DataFrame, stints: pd.DataFrame, games: pd.DataFrame) -> pd.DataFrame:
-    """Sequence-level controls from events/stints/games only (no tracking)."""
+    """Build sequence-level context (manpower, score, puck start) from events/stints/games; no tracking needed."""
+    # Join forecheck starts to events to get game_stint, then to stints for manpower/score
     starts = forechecks[["fc_sequence_id", "game_id", "sl_event_id_start", "pressing_team_id", "puck_x_at_start", "puck_y_at_start"]].copy()
     start_events = events[["game_id", "sl_event_id", "game_stint"]].drop_duplicates()
     starts = starts.merge(start_events, left_on=["game_id", "sl_event_id_start"], right_on=["game_id", "sl_event_id"], how="left")
@@ -50,6 +51,7 @@ def _build_sequence_controls(forechecks: pd.DataFrame, events: pd.DataFrame, sti
     starts = starts.merge(stints[stint_cols].drop_duplicates(), on=["game_id", "game_stint"], how="left")
     starts = starts.merge(games[["game_id", "home_team_id"]], on="game_id", how="left")
 
+    # Derive pressing team's score and manpower state (e.g. "5v5", "4v5")
     starts["pressing_is_home"] = (starts["pressing_team_id"] == starts["home_team_id"]).astype(int)
     is_pressing_home = starts["pressing_is_home"] == 1
     starts["pressing_score"] = np.where(is_pressing_home, starts["home_score"], starts["away_score"])
@@ -73,7 +75,7 @@ def _participants_from_stints(
     stints: pd.DataFrame,
     players: pd.DataFrame,
 ) -> pd.DataFrame:
-    """Pressing-team skaters on ice at terminal event (from stints via game_stint, no tracking)."""
+    """Pressing-team skaters on ice at terminal event. Uses stints (game_stint) only—no tracking required."""
     term_events = forechecks[["fc_sequence_id", "game_id", "sl_event_id_end", "pressing_team_id"]].merge(
         events[["game_id", "sl_event_id", "game_stint"]].drop_duplicates(),
         left_on=["game_id", "sl_event_id_end"],
@@ -81,6 +83,7 @@ def _participants_from_stints(
         how="inner",
     )[["fc_sequence_id", "game_id", "game_stint", "pressing_team_id"]]
 
+    # Exclude goalies from participants
     pos_col = "primary_position" if "primary_position" in players.columns else "position"
     if pos_col in players.columns:
         skater_ids = set(players.loc[~players[pos_col].isin({"G"}), "player_id"])
@@ -113,7 +116,7 @@ def _participants_from_stints(
 
 
 def build_terminal_table_participation() -> pd.DataFrame:
-    """Terminal table for participation attribution. Uses forechecks, events, stints—no tracking."""
+    """Build terminal-event table for participation attribution. Uses forechecks/events/stints only—no tracking."""
     forechecks = pd.read_parquet(FORECHECKS_PATH)
     events = pd.read_parquet(RAW_DIR / "events.parquet")
     stints = pd.read_parquet(RAW_DIR / "stints.parquet")
@@ -131,6 +134,7 @@ def build_terminal_table_participation() -> pd.DataFrame:
         lambda x: x if isinstance(x, list) and len(x) > 0 else []
     )
 
+    # Bin puck start location for baseline P(recovery | start state)
     terminal["x_bin"] = (terminal["puck_start_x"].astype(float) // 10).astype("Int64")
     terminal["y_bin"] = (terminal["puck_start_y"].astype(float).abs() // 10).astype("Int64")
 
@@ -141,6 +145,7 @@ def build_terminal_table_participation() -> pd.DataFrame:
     avg_recovery = float(terminal["sequence_success"].mean())
     p_start = terminal["p_recovery_given_start"].fillna(avg_recovery)
 
+    # Decompose: start_positioning = P(recovery|start) - avg; execution = observed - P(recovery|start)
     terminal["start_positioning_value"] = p_start - avg_recovery
     terminal["execution_value"] = terminal["sequence_success"].astype(float) - p_start
     terminal["total_recovery_value"] = terminal["sequence_success"].astype(float) - avg_recovery
@@ -148,12 +153,13 @@ def build_terminal_table_participation() -> pd.DataFrame:
 
 
 def build_terminal_table_from_hazard() -> pd.DataFrame:
-    """Terminal table from hazard features (requires tracking pipeline). For distance allocation."""
+    """Build terminal table from hazard_features. Requires tracking pipeline (F1..F5 distances). Used for distance allocation."""
     forechecks = pd.read_parquet(FORECHECKS_PATH)
     hazard = pd.read_parquet(HAZARD_PATH)
 
     seq_end = forechecks[["fc_sequence_id", "sl_event_id_end", "y"]].rename(columns={"y": "sequence_success"})
     terminal = hazard.merge(seq_end, on="fc_sequence_id", how="inner")
+    # Keep only the terminal-event row per sequence (where we have F1..F5 distances)
     terminal = terminal.loc[terminal["sl_event_id"] == terminal["sl_event_id_end"]].copy()
 
     terminal["x_bin"] = (terminal["puck_start_x"].astype(float) // 10).astype("Int64")
@@ -166,6 +172,7 @@ def build_terminal_table_from_hazard() -> pd.DataFrame:
     avg_recovery = float(terminal["sequence_success"].mean())
     p_start = terminal["p_recovery_given_start"].fillna(avg_recovery)
 
+    # Same value decomposition as participation path
     terminal["start_positioning_value"] = p_start - avg_recovery
     terminal["execution_value"] = terminal["sequence_success"].astype(float) - p_start
     terminal["total_recovery_value"] = terminal["sequence_success"].astype(float) - avg_recovery
@@ -173,7 +180,7 @@ def build_terminal_table_from_hazard() -> pd.DataFrame:
 
 
 def _build_slot_shares_participation(terminal: pd.DataFrame) -> dict[str, pd.Series]:
-    """Participation shares from F1..F5 (tracking-based). Kept for distance companion."""
+    """Equal shares among F1..F5 slots present. Used when allocating by slot (e.g. distance companion)."""
     slot_ids = [f"F{i}_id" for i in range(1, 6)]
     present = np.zeros(len(terminal), dtype=float)
     for sid in slot_ids:
@@ -183,8 +190,7 @@ def _build_slot_shares_participation(terminal: pd.DataFrame) -> dict[str, pd.Ser
 
 
 def _fallback_distance_ft(manpower_state) -> float:
-    """Fallback when no F1..F5 observed. Scale with expected skaters (manpower)."""
-    # manpower_state e.g. "5v5", "4v4", "5v4" -> use max skater count
+    """Fallback distance when no F1..F5 observed. Scale by manpower (5v5→50ft, 4v4→55ft, etc)."""
     if pd.isna(manpower_state) or not isinstance(manpower_state, str):
         return 50.0
     parts = manpower_state.lower().split("v")
@@ -202,7 +208,7 @@ def _build_distance_weights_with_unseen(
     participants: pd.DataFrame,
     eps: float = 1e-3,
 ) -> list[tuple[pd.Index, dict]]:
-    """Per-row (index, {player_id: share}). F1..F5 use 1/r; unseen use 1/max(d_puck_to_center, furthest_observed)."""
+    """Build distance-weighted shares per row. F1..F5 use 1/r; unseen participants use 1/max(puck_to_center, furthest_observed)."""
     terminal = terminal.merge(participants, on="fc_sequence_id", how="left")
     terminal["participant_ids"] = terminal["participant_ids"].apply(
         lambda x: x if isinstance(x, list) else []
@@ -217,6 +223,7 @@ def _build_distance_weights_with_unseen(
         weights: dict = {}
         observed_distances = []
 
+        # F1..F5: weight by inverse distance to carrier
         for i in range(1, 6):
             sid = f"F{i}_id"
             rcol = f"F{i}_r"
@@ -227,7 +234,7 @@ def _build_distance_weights_with_unseen(
                     observed_distances.append(dist)
                 weights[pid] = 1.0 / max(dist, eps) if np.isfinite(dist) else 0.0
 
-        # Unseen (e.g. 5 on ice, only 3 distances): d = max(puck→center, furthest of observed)
+        # Unseen participants (on ice but not in F1..F5): use max(puck→center, furthest observed)
         furthest_observed = max(observed_distances) if observed_distances else 0.0
         d_to_center = float(d_puck_to_center.loc[idx]) if np.isfinite(d_puck_to_center.loc[idx]) else 50.0
         d_unseen = max(d_to_center, furthest_observed)
@@ -245,14 +252,14 @@ def _build_distance_weights_with_unseen(
         total = sum(weights.values())
         if total <= 0:
             continue
-        shares = {p: w / total for p, w in weights.items()}
+        shares = {p: w / total for p, w in weights.items()}  # normalize to sum to 1
         rows_out.append((idx, shares))
 
     return rows_out
 
 
 def _allocate_values_slots(terminal: pd.DataFrame, slot_shares: dict[str, pd.Series], suffix: str) -> pd.DataFrame:
-    """Allocate by F1..F5 slot shares (for distance allocation)."""
+    """Allocate start_positioning, execution, total value by F1..F5 slot shares; aggregate to player level."""
     parts: list[pd.DataFrame] = []
     slot_ids = list(slot_shares.keys())
 
@@ -293,7 +300,7 @@ def _allocate_values_slots(terminal: pd.DataFrame, slot_shares: dict[str, pd.Ser
 
 
 def allocate_participation_from_participants(terminal: pd.DataFrame) -> pd.DataFrame:
-    """Equal split among participants (from stints). Terminal must have 'participant_ids' column."""
+    """Equal split of value among participants. Terminal must have 'participant_ids' (from stints)."""
     rows = []
     for _, r in terminal.iterrows():
         pids = r["participant_ids"]
@@ -342,7 +349,7 @@ def allocate_distance(
     participants: pd.DataFrame,
     eps: float = 1e-3,
 ) -> pd.DataFrame:
-    """Distance-weighted allocation. F1..F5 use 1/r; unseen participants use 1/d_to_center."""
+    """Distance-weighted allocation. F1..F5 use 1/r; unseen use fallback distance. Normalize per row and aggregate."""
     weight_rows = _build_distance_weights_with_unseen(terminal, participants, eps=eps)
 
     rows = []
@@ -420,11 +427,11 @@ def main() -> None:
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
-    # Participation: from stints only (no tracking)
+    # ---- Participation attribution: stints only, no tracking ----
     terminal_participation = build_terminal_table_participation()
     participation = allocate_participation_from_participants(terminal_participation)
 
-    # Distance: requires hazard_features (tracking pipeline)
+    # ---- Distance attribution: requires hazard_features (tracking pipeline) ----
     try:
         forechecks = pd.read_parquet(FORECHECKS_PATH)
         events = pd.read_parquet(RAW_DIR / "events.parquet")
