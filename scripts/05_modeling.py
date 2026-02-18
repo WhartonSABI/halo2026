@@ -353,13 +353,14 @@ def _write_clean_csv(credit: pd.DataFrame, out_path: Path) -> None:
         "total_execution_credit": "execution",
     })
     out["total"] = out["start_positioning"] + out["execution"]
+    out["total_per_press"] = np.where(out["n_presses"] > 0, out["total"] / out["n_presses"], np.nan)
     out = out.sort_values("total", ascending=False).reset_index(drop=True)
     out = out.merge(
         players_df[[c for c in [pid_col, name_col, pos_col] if c in players_df.columns]].rename(columns=merge_cols),
         on="player_id",
         how="left",
     )
-    out_cols = ["player_id", "player_name", "position", "n_presses", "n_rows", "start_positioning", "execution", "total"]
+    out_cols = ["player_id", "player_name", "position", "n_presses", "n_rows", "start_positioning", "execution", "total", "total_per_press"]
     out = out[[c for c in out_cols if c in out.columns]]
     out.to_csv(out_path, index=False)
 
