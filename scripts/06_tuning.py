@@ -11,19 +11,24 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
-from typing import Iterable
 
 import numpy as np
 import pandas as pd
-from sklearn.compose import ColumnTransformer
-from sklearn.impute import SimpleImputer
 from sklearn.metrics import classification_report, log_loss
 from sklearn.ensemble import GradientBoostingClassifier, HistGradientBoostingClassifier
 from sklearn.model_selection import GroupKFold, GroupShuffleSplit, RandomizedSearchCV
 from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import OneHotEncoder, SplineTransformer, StandardScaler
 
 import xgboost as xgb
+
+import importlib.util
+_preprocess_path = Path(__file__).resolve().parent / "05_preprocess.py"
+_spec = importlib.util.spec_from_file_location("preprocess", _preprocess_path)
+_preprocess = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(_preprocess)
+TimeAugmenter = _preprocess.TimeAugmenter
+build_feature_lists = _preprocess.build_feature_lists
+build_preprocessor = _preprocess.build_preprocessor
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DATA_PATH = PROJECT_ROOT / "data" / "processed" / "hazard_features.parquet"
@@ -33,25 +38,6 @@ RANDOM_STATE = 7
 N_CV_FOLDS = 5
 N_ITER_RANDOM = 50  # RandomizedSearch iterations per model
 N_JOBS = -1
-
-
-class TimeAugmenter:
-    """Add log and sqrt time basis features."""
-
-    def fit(self, X: pd.DataFrame, y: pd.Series | None = None) -> "TimeAugmenter":
-        return self
-
-    def transform(self, X: pd.DataFrame) -> pd.DataFrame:
-        X = X.copy()
-        t = X["time_since_start_s"].astype(float).clip(lower=0.0)
-        X["log_time_since_start_s"] = np.log1p(t)
-        X["sqrt_time_since_start_s"] = np.sqrt(t)
-        return X
-
-    def get_feature_names_out(self, input_features: Iterable[str] | None = None) -> np.ndarray:
-        if input_features is None:
-            return np.array([])
-        return np.asarray(list(input_features) + ["log_time_since_start_s", "sqrt_time_since_start_s"])
 
 
 def load_data() -> pd.DataFrame:
@@ -71,45 +57,7 @@ def split_groups(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
     return df.iloc[tr_idx].copy(), df.iloc[te_idx].copy()
 
 
-def build_feature_lists(df: pd.DataFrame) -> tuple[list[str], list[str]]:
-    """Partition columns into numeric and categorical."""
-    ignore = {
-        "fc_sequence_id", "sl_event_id", "event_t", "terminal_failure_t",
-        "target_class", "carrier_id", "F1_id", "F2_id", "F3_id", "F4_id", "F5_id",
-    }
-    feature_cols = [c for c in df.columns if c not in ignore]
-    numeric_cols = [c for c in feature_cols if pd.api.types.is_numeric_dtype(df[c])]
-    cat_cols = [c for c in feature_cols if c not in numeric_cols]
-    return numeric_cols, cat_cols
-
-
-def build_preprocessor(numeric_cols: list[str], cat_cols: list[str]) -> ColumnTransformer:
-    """Build preprocessing: impute, spline time, scale, one-hot."""
-    time_spline_cols = ["time_since_start_s"]
-    numeric_main_cols = [c for c in numeric_cols if c not in time_spline_cols]
-
-    numeric_main = Pipeline([
-        ("imputer", SimpleImputer(strategy="median")),
-        ("scaler", StandardScaler()),
-    ])
-    time_spline = Pipeline([
-        ("imputer", SimpleImputer(strategy="median")),
-        ("spline", SplineTransformer(n_knots=5, degree=3, include_bias=False)),
-        ("scaler", StandardScaler()),
-    ])
-    categorical = Pipeline([
-        ("imputer", SimpleImputer(strategy="most_frequent")),
-        ("onehot", OneHotEncoder(handle_unknown="ignore", sparse_output=False)),
-    ])
-
-    return ColumnTransformer([
-        ("num", numeric_main, numeric_main_cols),
-        ("time_spline", time_spline, time_spline_cols),
-        ("cat", categorical, cat_cols),
-    ])
-
-
-def get_model_configs(preprocessor: ColumnTransformer) -> list[tuple[str, Pipeline, dict]]:
+def get_model_configs(preprocessor) -> list[tuple[str, Pipeline, dict]]:
     """Return list of (name, estimator, param_distributions) for tuning."""
     time_aug = TimeAugmenter()
     configs: list[tuple[str, Pipeline, dict]] = []
