@@ -4,7 +4,7 @@
 Merges results from:
 - participation.csv (04_simple_attribution, equal split)
 - distance.csv (04_simple_attribution, distance-weighted)
-- modeling.csv (04_modeling, hazard-model counterfactual credits)
+- modeling.csv (05_modeling, hazard-model counterfactual credits)
 
 Output: ranking.csv with composite_rank = mean of individual method ranks.
 """
@@ -34,7 +34,7 @@ def main() -> None:
         dfs.append(("modeling", m[["player_id", "n_rows", "total", "rank_model"]].rename(columns={"total": "total_modeling"})))
 
     if not dfs:
-        print("No result CSVs found. Run 04_simple_attribution and 04_modeling first.")
+        print("No result CSVs found. Run 04_simple_attribution and 05_modeling first.")
         return
 
     # ---- Outer merge on player_id; each method contributes its rank and total ----
