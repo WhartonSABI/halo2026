@@ -23,15 +23,24 @@ def main() -> None:
     if (RESULTS / "participation.csv").exists():
         p = pd.read_csv(RESULTS / "participation.csv")
         p["rank_participation"] = p["total"].rank(ascending=False, method="min")  # higher total = better rank
-        dfs.append(("participation", p[["player_id", "total", "rank_participation"]].rename(columns={"total": "total_participation"})))
+        cols = ["player_id", "total", "rank_participation"]
+        if "n_press" in p.columns:
+            cols.insert(1, "n_press")
+        dfs.append(("participation", p[cols].rename(columns={"total": "total_participation"})))
     if (RESULTS / "distance.csv").exists():
         d = pd.read_csv(RESULTS / "distance.csv")
         d["rank_distance"] = d["total"].rank(ascending=False, method="min")
-        dfs.append(("distance", d[["player_id", "total", "rank_distance"]].rename(columns={"total": "total_distance"})))
+        cols = ["player_id", "total", "rank_distance"]
+        if "n_press" in d.columns:
+            cols.insert(1, "n_press")
+        dfs.append(("distance", d[cols].rename(columns={"total": "total_distance"})))
     if (RESULTS / "modeling.csv").exists():
         m = pd.read_csv(RESULTS / "modeling.csv")
-        m["rank_model"] = m["total"].rank(ascending=False, method="min")
-        dfs.append(("modeling", m[["player_id", "n_rows", "total", "rank_model"]].rename(columns={"total": "total_modeling"})))
+        m["rank_model"] = m["total_check"].rank(ascending=False, method="min")
+        cols = ["player_id", "n_rows", "total_check", "rank_model"]
+        if "n_press" in m.columns:
+            cols.insert(1, "n_press")
+        dfs.append(("modeling", m[cols].rename(columns={"total_check": "total_modeling"})))
 
     if not dfs:
         print("No result CSVs found. Run 04_simple_attribution and 05_modeling first.")
@@ -41,6 +50,12 @@ def main() -> None:
     merged = dfs[0][1]
     for _, df in dfs[1:]:
         merged = merged.merge(df, on="player_id", how="outer")
+
+    # Coalesce n_press from any source (columns may be n_press, n_press_x, n_press_y)
+    n_press_cols = [c for c in merged.columns if c == "n_press" or c.startswith("n_press_")]
+    if n_press_cols:
+        merged["n_press"] = merged[n_press_cols].bfill(axis=1).iloc[:, 0]
+        merged = merged.drop(columns=[c for c in n_press_cols if c != "n_press"], errors="ignore")
 
     rank_cols = [c for c in merged.columns if c.startswith("rank_")]
     merged["avg_rank"] = merged[rank_cols].mean(axis=1)

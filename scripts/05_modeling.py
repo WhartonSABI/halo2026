@@ -302,16 +302,7 @@ def build_player_press_credit(
 
     if not credit_rows:
         return pd.DataFrame(
-            columns=[
-                "player_id",
-                "n_rows",
-                "total_start_positioning_credit",
-                "avg_start_positioning_credit",
-                "total_execution_credit",
-                "avg_execution_credit",
-                "total_press_credit",
-                "avg_press_credit",
-            ]
+            columns=["player_id", "n_rows", "n_press", "positioning", "execution", "total", "total_per_press"]
         )
 
     per_row = pd.concat(credit_rows, ignore_index=True)
@@ -320,21 +311,31 @@ def build_player_press_credit(
     for col in ["start_positioning_credit", "execution_credit", "total_press_credit"]:
         per_row[col] = per_row[col].clip(lower=-1.0, upper=1.0)
 
-    # Aggregate row-level credits to player totals and means
-    summary = (
-        per_row.groupby("player_id", as_index=False)
+    # Per (player, press): positioning = start value (once per press); execution = mean over frames
+    per_press = (
+        per_row.groupby(["player_id", "fc_sequence_id"], as_index=False)
         .agg(
-            n_rows=("total_press_credit", "size"),
-            n_presses=("fc_sequence_id", "nunique"),
-            total_start_positioning_credit=("start_positioning_credit", "sum"),
-            avg_start_positioning_credit=("start_positioning_credit", "mean"),
-            total_execution_credit=("execution_credit", "sum"),
-            avg_execution_credit=("execution_credit", "mean"),
-            total_press_credit=("total_press_credit", "sum"),
-            avg_press_credit=("total_press_credit", "mean"),
+            positioning=("start_positioning_credit", "first"),  # same for all rows in press
+            execution=("execution_credit", "mean"),  # avg gain/loss over frames player is in
         )
-        .sort_values("total_press_credit", ascending=False)
     )
+    per_press["total_in_press"] = per_press["positioning"] + per_press["execution"]
+
+    # Sum across presses for player totals
+    n_rows = per_row.groupby("player_id").size().reset_index(name="n_rows")
+    summary = (
+        per_press.groupby("player_id", as_index=False)
+        .agg(
+            n_press=("fc_sequence_id", "nunique"),
+            positioning=("positioning", "sum"),
+            execution=("execution", "sum"),
+            total=("total_in_press", "sum"),
+        )
+    )
+    summary = summary.merge(n_rows, on="player_id", how="left")
+    summary["total_per_press"] = np.where(summary["n_press"] > 0, summary["total"] / summary["n_press"], np.nan)
+    summary = summary.sort_values("total", ascending=False).reset_index(drop=True)
+
     return summary
 
 
@@ -347,20 +348,20 @@ def _write_clean_csv(credit: pd.DataFrame, out_path: Path) -> None:
     merge_cols = {pid_col: "player_id", name_col: "player_name"}
     if pos_col in players_df.columns:
         merge_cols[pos_col] = "position"
-    out = credit[["player_id", "n_rows", "n_presses", "total_start_positioning_credit", "total_execution_credit"]].copy()
+    out = credit[["player_id", "n_rows", "n_press", "positioning", "execution", "total", "total_per_press"]].copy()
     out = out.rename(columns={
-        "total_start_positioning_credit": "start_positioning",
-        "total_execution_credit": "execution",
+        "positioning": "total_positioning",
+        "execution": "total_execution",
+        "total": "total_check",
+        "total_per_press": "check_per_press",
     })
-    out["total"] = out["start_positioning"] + out["execution"]
-    out["total_per_press"] = np.where(out["n_presses"] > 0, out["total"] / out["n_presses"], np.nan)
-    out = out.sort_values("total", ascending=False).reset_index(drop=True)
+    out = out.sort_values("total_check", ascending=False).reset_index(drop=True)  # summary already sorted
     out = out.merge(
         players_df[[c for c in [pid_col, name_col, pos_col] if c in players_df.columns]].rename(columns=merge_cols),
         on="player_id",
         how="left",
     )
-    out_cols = ["player_id", "player_name", "position", "n_presses", "n_rows", "start_positioning", "execution", "total", "total_per_press"]
+    out_cols = ["player_id", "player_name", "position", "n_press", "n_rows", "total_positioning", "total_execution", "total_check", "check_per_press"]
     out = out[[c for c in out_cols if c in out.columns]]
     out.to_csv(out_path, index=False)
 
