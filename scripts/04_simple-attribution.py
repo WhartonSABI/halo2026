@@ -140,19 +140,19 @@ def _build_distance_weights_with_unseen(
     terminal: pd.DataFrame,
     participants: pd.DataFrame,
     eps: float = 1e-3,
-) -> list[tuple[pd.Index, dict]]:
+) -> list[tuple[pd.Series, dict]]:
     """Build distance-weighted shares per row. F1..F5 use 1/r; unseen participants use 1/max(puck_to_center, furthest_observed)."""
-    terminal = terminal.merge(participants, on="fc_sequence_id", how="left")
-    terminal["participant_ids"] = terminal["participant_ids"].apply(
+    merged = terminal.merge(participants, on="fc_sequence_id", how="left")
+    merged["participant_ids"] = merged["participant_ids"].apply(
         lambda x: x if isinstance(x, list) else []
     )
 
-    cx = terminal["carrier_x"].astype(float).fillna(0)
-    cy = terminal["carrier_y"].astype(float).fillna(0)
+    cx = merged["carrier_x"].astype(float).fillna(0)
+    cy = merged["carrier_y"].astype(float).fillna(0)
     d_puck_to_center = np.hypot(cx, cy)
 
     rows_out = []
-    for idx, r in terminal.iterrows():
+    for idx, r in merged.iterrows():
         weights: dict = {}
         observed_distances = []
 
@@ -186,7 +186,7 @@ def _build_distance_weights_with_unseen(
         if total <= 0:
             continue
         shares = {p: w / total for p, w in weights.items()}  # normalize to sum to 1
-        rows_out.append((idx, shares))
+        rows_out.append((r, shares))
 
     return rows_out
 
@@ -235,8 +235,7 @@ def allocate_distance(
     weight_rows = _build_distance_weights_with_unseen(terminal, participants, eps=eps)
 
     rows = []
-    for idx, shares in weight_rows:
-        r = terminal.loc[idx]
+    for r, shares in weight_rows:
         for pid, share in shares.items():
             rows.append(
                 {
