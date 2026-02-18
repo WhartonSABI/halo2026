@@ -107,13 +107,17 @@ def build_forecheck_sequences(events: pd.DataFrame) -> pd.DataFrame:
     scan["is_terminal"] = is_stoppage | is_zone_exit | is_team_a
 
     terminal = scan[scan["is_terminal"]].copy()
-    first_term = terminal.loc[terminal.groupby(["game_id", "sequence_id", "sl_event_id_dumpin"])["sl_event_id"].idxmin()]
+    first_term = terminal.loc[terminal.groupby(["game_id", "sequence_id", "sl_event_id_dumpin"])["sl_event_id"].idxmin()].copy()
 
-    # Effective condition: stoppage overrides zone_exit overrides team_a
+    # Compute terminal booleans on first_term (avoids index alignment after merges)
+    is_stoppage_ft = first_term["event_type"].isin(STOPPAGE)
+    x_ft = first_term["x"].astype(float)
+    sn_ft = first_term["sign_negative"]
+    is_zone_exit_ft = x_ft.notna() & ((sn_ft & (x_ft > -BLUE_LINE)) | (~sn_ft & (x_ft < BLUE_LINE)))
     first_term["outcome"] = np.where(
-        is_stoppage.loc[first_term.index],
+        is_stoppage_ft,
         "failure",
-        np.where(is_zone_exit.loc[first_term.index], "failure", "success"),
+        np.where(is_zone_exit_ft, "failure", "success"),
     )
     # Need defending_team_id for penalty outcome
     first_term = first_term.merge(
@@ -128,10 +132,17 @@ def build_forecheck_sequences(events: pd.DataFrame) -> pd.DataFrame:
     first_term.loc[penalty_on_pressing, "outcome"] = "failure"
     first_term.loc[penalty_on_defending, "outcome"] = "success"
     first_term["y"] = (first_term["outcome"] == "success").astype(int)
+    # Recompute booleans after merge so they align with current first_term
+    is_stoppage_ft = first_term["event_type"].isin(STOPPAGE)
+    x_ft = first_term["x"].astype(float)
+    is_zone_exit_ft = x_ft.notna() & (
+        (first_term["sign_negative"] & (x_ft > -BLUE_LINE))
+        | (~first_term["sign_negative"] & (x_ft < BLUE_LINE))
+    )
     first_term["terminal_event_type"] = np.where(
-        is_stoppage.loc[first_term.index],
+        is_stoppage_ft,
         first_term["event_type"],
-        np.where(is_zone_exit.loc[first_term.index], "zone_exit", np.where(first_term["event_type"] == "lpr", "lpr", "possession")),
+        np.where(is_zone_exit_ft, "zone_exit", np.where(first_term["event_type"] == "lpr", "lpr", "possession")),
     )
 
     # Drop period-end whistles (do not count as success or failure)
