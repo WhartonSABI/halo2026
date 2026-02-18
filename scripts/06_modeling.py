@@ -3,8 +3,8 @@
 
 This script fits three event-level classifiers over hazard rows:
 1) Multinomial logistic regression (baseline, interpretable)
-2) Gradient boosting (nonlinear interactions)
-3) Neural net (MLP)
+2) Histogram gradient boosting (sklearn GBM)
+3) XGBoost (tuned via 05_tuning.py; see README)
 
 Target classes:
 - 0: no terminal event at this row
@@ -39,11 +39,11 @@ from sklearn.compose import ColumnTransformer
 from sklearn.impute import SimpleImputer
 from sklearn.metrics import classification_report, log_loss
 from sklearn.model_selection import GroupShuffleSplit
-from sklearn.neural_network import MLPClassifier
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, SplineTransformer, StandardScaler
 from sklearn.linear_model import LogisticRegression
 from sklearn.ensemble import HistGradientBoostingClassifier, RandomForestRegressor
+import xgboost as xgb
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DATA_PATH = PROJECT_ROOT / "data" / "processed" / "hazard_features.parquet"
@@ -523,15 +523,19 @@ def main() -> None:
             max_iter=300,
             random_state=RANDOM_STATE,
         ),
-        "neural_net_mlp": MLPClassifier(
-            hidden_layer_sizes=(128, 64),
-            activation="relu",
-            solver="adam",
-            alpha=1e-4,
-            learning_rate_init=1e-3,
-            max_iter=200,
+        "xgboost": xgb.XGBClassifier(
+            objective="multi:softprob",
+            num_class=3,
+            max_depth=8,
+            learning_rate=0.05,
+            n_estimators=800,
+            min_child_weight=5,
+            subsample=0.8,
+            colsample_bytree=1.0,
+            reg_alpha=1.0,
+            reg_lambda=1.0,
             random_state=RANDOM_STATE,
-            early_stopping=True,
+            n_jobs=-1,
         ),
     }
 

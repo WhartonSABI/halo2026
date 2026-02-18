@@ -22,8 +22,9 @@ Place raw data in `data/raw/`, then run:
 python scripts/01_forechecks.py
 python scripts/02_features.py
 python scripts/04_simple-attribution.py
-python scripts/05_modeling.py
-python scripts/06_build-ranking.py
+python scripts/05_tuning.py       # GBM/XGBoost tuning (optional; run before modeling)
+python scripts/06_modeling.py
+python scripts/07_build-ranking.py
 ```
 
 Outputs: `data/results/ranking.csv` (composite player ranks), `participation.csv`, `distance.csv`, `modeling.csv`.
@@ -54,10 +55,29 @@ Sequences are built by `01_forechecks.py`: each starts with a dump-in and the de
 | 2 | `02_features.py` | processed forecheck data, raw | `hazard_features.parquet` |
 | 3 | `03_eda.py` | processed, raw | `plots/game_play_*.gif` *(optional)* |
 | 4 | `04_simple-attribution.py` | forechecks, hazard features, raw | `terminal_recovery_value.parquet`, `participation.csv`, `distance.csv` |
-| 5 | `05_modeling.py` | `hazard_features.parquet` | `modeling.csv`, `model_summary.csv` |
-| 6 | `06_build-ranking.py` | participation, distance, modeling CSVs | `ranking.csv` (composite rank) |
+| 5 | `05_tuning.py` | `hazard_features.parquet` | `tuning_results.csv` *(GBM/XGBoost tuning, optional)* |
+| 6 | `06_modeling.py` | `hazard_features.parquet` | `modeling.csv`, `model_summary.csv` |
+| 7 | `07_build-ranking.py` | participation, distance, modeling CSVs | `ranking.csv` (composite rank) |
 
 Paths are relative to `scripts/` and `data/` (`raw/`, `processed/`, `results/`). See `data_dictionary.md` for raw schema.
+
+---
+
+## Model tuning
+
+**Tuning** (`scripts/05_tuning.py`) runs first and tunes HistGradientBoosting, GradientBoosting, and XGBoost. The hazard classifier in `06_modeling.py` compares multiple models (logit, HistGradientBoosting, XGBoost) and uses the best by log loss for player attribution:
+
+- **Method:** `RandomizedSearchCV` with group-based cross-validation (`GroupKFold` on `fc_sequence_id`) to avoid sequence leakage
+- **Metric:** log loss (3-class: ongoing, success, failure)
+- **Search:** 50 random draws per model (10 in `--quick` mode)
+- **Models:** HistGradientBoosting, GradientBoosting (sklearn), XGBoost
+
+Best config from tuning is used in the main pipeline. To re-run tuning:
+
+```bash
+python scripts/05_tuning.py          # full: 50 iterations per model
+python scripts/05_tuning.py --quick  # quick: 10 iterations per model
+```
 
 ---
 
@@ -70,8 +90,9 @@ Paths are relative to `scripts/` and `data/` (`raw/`, `processed/`, `results/`).
 │   ├── 02_features.py           # Hazard features
 │   ├── 03_eda.py                # EDA animations (optional)
 │   ├── 04_simple-attribution.py # Participation & distance attribution
-│   ├── 05_modeling.py          # Hazard models + counterfactual credit
-│   └── 06_build-ranking.py    # Composite ranking
+│   ├── 05_tuning.py            # GBM/XGBoost hyperparameter tuning (optional)
+│   ├── 06_modeling.py         # Hazard models + counterfactual credit
+│   └── 07_build-ranking.py   # Composite ranking
 ├── data/
 │   ├── raw/                     # events, games, players, stints, tracking
 │   ├── processed/               # forechecks, hazard_features, terminal_recovery_value

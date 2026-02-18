@@ -1,0 +1,4 @@
+model,cv_log_loss,test_log_loss,best_params
+xgboost,0.11596391350904141,0.11619783829250252,"{'model__subsample': 0.8, 'model__reg_lambda': 1.0, 'model__reg_alpha': 1.0, 'model__n_estimators': 800, 'model__min_child_weight': 5, 'model__max_depth': 8, 'model__learning_rate': 0.05, 'model__colsample_bytree': 1.0}"
+gbm,0.1161477462494827,0.11641244889815976,"{'model__subsample': 1.0, 'model__n_estimators': 300, 'model__min_samples_leaf': 20, 'model__max_features': 'sqrt', 'model__max_depth': 10, 'model__learning_rate': 0.05}"
+hist_gbm,0.12127206914890605,0.12474881437912283,"{'model__min_samples_leaf': 20, 'model__max_iter': 500, 'model__max_depth': 6, 'model__max_bins': 255, 'model__learning_rate': 0.1, 'model__l2_regularization': 0.1}"
