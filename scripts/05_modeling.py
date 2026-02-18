@@ -20,7 +20,8 @@ Player crediting logic (value of a press):
 - For each hazard row, define press value = P(success) - P(failure).
 - For each forechecker slot F1..F5, compute a leave-one-out counterfactual by
   removing the slot player ID and replacing slot pressure/lane features with
-  contextual medians (same manpower/score/time-bin context when possible).
+  the nearest real observation to the joint center (within context). This
+  represents "average player" with everyone else fixed.
 - Slot credit on the row is the drop in press value under this counterfactual.
   Positive credit means that player's pressure increased expected success
   relative to failure.
@@ -181,20 +182,19 @@ def evaluate_model(name: str, model: Pipeline, X_test: pd.DataFrame, y_test: pd.
     }
 
 
-def contextual_median_slot_replacement(df: pd.DataFrame, slot: str) -> pd.DataFrame:
-    """Counterfactual: remove slot identity and replace slot features by contextual medians.
+def _nearest_to_center_slot_replacement(df: pd.DataFrame, slot: str) -> pd.DataFrame:
+    """Counterfactual: replace slot features with nearest real observation to joint center.
 
-    Used for leave-one-out attribution: simulate "this player wasn't here" by replacing
-    their pressure/lane features with the median under the same manpower/score/time context.
+    Within each context (manpower, score, time bin), find the observation whose slot-feature
+    vector is closest to the mean (Euclidean). Use that observation's slot features for all
+    rows in that context. This represents "average player" and stays within data support.
     """
     cf = df.copy()
 
-    # Erase player identity so the model cannot use "who" is in the slot
     slot_id = f"{slot}_id"
     if slot_id in cf.columns:
         cf[slot_id] = np.nan
 
-    # Slot-specific pressure and geometry features to replace
     slot_cols = [
         f"{slot}_r",
         f"{slot}_vr_carrier",
@@ -205,22 +205,59 @@ def contextual_median_slot_replacement(df: pd.DataFrame, slot: str) -> pd.DataFr
         f"{slot}_r_nearestOpp",
         f"{slot}_vr_nearestOpp",
     ]
+    slot_cols = [c for c in slot_cols if c in df.columns]
+    if not slot_cols:
+        return cf
 
-    # Replace with median within same game context (manpower, score, time bin)
     context_candidates = ["manpower_state", "score_diff_bin", "time_since_start_bin"]
     context_cols = [c for c in context_candidates if c in df.columns]
 
-    for col in slot_cols:
-        if col not in cf.columns:
+    # Build context key for each row
+    if context_cols:
+        context_key = df[context_cols].fillna("__nan__").astype(str).agg("|".join, axis=1)
+    else:
+        context_key = pd.Series("__global__", index=df.index)
+
+    # For each context: center = mean of slot features; medoid = row nearest to center
+    slot_mat = df[slot_cols].astype(float)
+    replacement_by_idx: dict[int, np.ndarray] = {}
+
+    for ctx, group_idx in context_key.groupby(context_key).groups.items():
+        idx = group_idx.tolist()
+        sub = slot_mat.loc[group_idx]
+        valid = sub.notna().all(axis=1)
+        if not valid.any():
             continue
+        sub_valid = sub.loc[valid]
+        center = sub_valid.mean(axis=0).values
+        diffs = sub_valid.values - center
+        dists = np.sqrt((diffs**2).sum(axis=1))
+        medoid_local_idx = int(np.argmin(dists))
+        medoid_vals = sub_valid.iloc[medoid_local_idx].values
+        for i in idx:
+            replacement_by_idx[i] = medoid_vals
 
-        if context_cols:
-            contextual = df.groupby(context_cols, dropna=False)[col].transform("median")
-            replacement = contextual.fillna(df[col].median())  # fallback if context missing
-        else:
-            replacement = pd.Series(df[col].median(), index=df.index)
+    # Global fallback for contexts with no valid replacement
+    global_valid = slot_mat.notna().all(axis=1)
+    if global_valid.any():
+        global_sub = slot_mat.loc[global_valid]
+        global_center = global_sub.mean(axis=0).values
+        diffs = global_sub.values - global_center
+        dists = np.sqrt((diffs**2).sum(axis=1))
+        global_medoid_vals = global_sub.iloc[int(np.argmin(dists))].values
+    else:
+        global_medoid_vals = slot_mat.mean(axis=0).values  # fallback to marginal mean
 
-        cf[col] = replacement
+    for i in df.index:
+        if i not in replacement_by_idx:
+            replacement_by_idx[i] = global_medoid_vals
+
+    # Assign replacements
+    repl_df = pd.DataFrame(
+        {c: [replacement_by_idx[i][j] for i in df.index] for j, c in enumerate(slot_cols)},
+        index=df.index,
+    )
+    cf[slot_cols] = repl_df
 
     return cf
 
@@ -271,7 +308,7 @@ def build_player_press_credit(
         if slot_id not in source_df.columns:
             continue
 
-        cf_features = contextual_median_slot_replacement(X_source, slot)
+        cf_features = _nearest_to_center_slot_replacement(X_source, slot)
         cf_proba = model.predict_proba(cf_features)
         cf_press_value = cf_proba[:, 1] - cf_proba[:, 2]
 
