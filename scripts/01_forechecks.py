@@ -148,16 +148,15 @@ def build_forecheck_sequences(events: pd.DataFrame) -> pd.DataFrame:
     # Drop period-end whistles (do not count as success or failure)
     max_pt = events.groupby(["game_id", "period"])["period_time"].max().reset_index().rename(columns={"period_time": "max_period_time"})
     first_term = first_term.merge(max_pt, on=["game_id", "period"], how="left")
-    period_end_whistle = (
-        (first_term["event_type"] == "whistle")
-        & (first_term["period_time"] >= first_term["max_period_time"] - 1.0)
-    )
+    pt = first_term["period_time"].astype(float)
+    max_pt_val = first_term["max_period_time"].astype(float)
+    period_end_whistle = (first_term["event_type"] == "whistle") & (pt >= max_pt_val - 1.0)
     first_term = first_term.loc[~period_end_whistle].drop(columns=["max_period_time"])
 
     fc = (
         first_term
         .merge(
-            starts[["game_id", "sequence_id", "sl_event_id_dumpin", "period", "period_time", "dumpin_detail", "lpr_detail", "puck_x_at_start", "puck_y_at_start"]],
+            starts[["game_id", "sequence_id", "sl_event_id_dumpin", "dumpin_detail", "lpr_detail", "puck_x_at_start", "puck_y_at_start"]],
             on=["game_id", "sequence_id", "sl_event_id_dumpin"],
             how="left",
         )
