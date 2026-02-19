@@ -22,13 +22,17 @@ def main() -> None:
     dfs = []
     if (RESULTS / "participation.csv").exists():
         p = pd.read_csv(RESULTS / "participation.csv")
-        p["rank_participation"] = p["total"].rank(ascending=False, method="min")  # higher total = better rank
+        if "n_presses" in p.columns and "n_press" not in p.columns:
+            p = p.rename(columns={"n_presses": "n_press"})
+        p["rank_participation"] = p["total"].rank(ascending=False, method="min")
         cols = ["player_id", "total", "rank_participation"]
         if "n_press" in p.columns:
             cols.insert(1, "n_press")
         dfs.append(("participation", p[cols].rename(columns={"total": "total_participation"})))
     if (RESULTS / "distance.csv").exists():
         d = pd.read_csv(RESULTS / "distance.csv")
+        if "n_presses" in d.columns and "n_press" not in d.columns:
+            d = d.rename(columns={"n_presses": "n_press"})
         d["rank_distance"] = d["total"].rank(ascending=False, method="min")
         cols = ["player_id", "total", "rank_distance"]
         if "n_press" in d.columns:

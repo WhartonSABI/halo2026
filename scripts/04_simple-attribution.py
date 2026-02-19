@@ -289,6 +289,8 @@ def _write_clean_csv(
         on="player_id",
         how="left",
     )
+    if "n_presses" in out.columns and "n_press" not in out.columns:
+        out = out.rename(columns={"n_presses": "n_press"})
     out_cols = ["player_id", "player_name", "position", "n_press", "total", "total_per_press"]
     out = out[[c for c in out_cols if c in out.columns]]
     out.to_csv(out_path, index=False)

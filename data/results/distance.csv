@@ -1,4 +1,4 @@
-player_id,player_name,position,n_presses,total,total_per_press
+player_id,player_name,position,n_press,total,total_per_press
 5cfb433e-f489-5965-e0f1-6ccb5d7a2b2c,"Nikkanen, Henri",C,201,10.525981284711447,0.052368066093091775
 41628483-4877-7355-2278-bf4aca0a7017,"Teply, Michal",F,249,10.452281495738141,0.04197703411943029
 69aa4743-6d37-4847-9c9e-f55a0d888150,"Weatherby, Jasper",F,207,10.386078604417113,0.0501742927749619

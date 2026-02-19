@@ -1,4 +1,4 @@
-player_id,player_name,position,n_presses,total,total_per_press
+player_id,player_name,position,n_press,total,total_per_press
 9b65e913-a13d-a05b-9427-55f8feacc295,"Bitten, William",F,186,5.188258897418005,0.027893865039881748
 e687b686-2fb1-2fe6-dce2-df6b6c938539,"Ahcan, Jack",D,328,4.515348918353107,0.013766307677905813
 6815a801-6584-a22a-0db0-2dc6e23d8928,"Capobianco, Kyle",D,377,4.14773435682717,0.01100194789609329
