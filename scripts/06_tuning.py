@@ -10,6 +10,7 @@ Target: 3-class classification (ongoing=0, success=1, failure=2); metric = log l
 from __future__ import annotations
 
 import argparse
+import os
 from pathlib import Path
 
 import numpy as np
@@ -38,7 +39,7 @@ RESULTS_DIR = PROJECT_ROOT / "data" / "results"
 RANDOM_STATE = 7
 N_CV_FOLDS = 5
 N_ITER_RANDOM = 50  # RandomizedSearch iterations per model
-N_JOBS = -1
+N_JOBS = max(1, (os.cpu_count() or 1) - 1)  # all cores minus one
 
 
 def load_data() -> pd.DataFrame:
