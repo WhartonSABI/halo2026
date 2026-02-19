@@ -123,3 +123,52 @@ def build_preprocessor(numeric_cols: list[str], cat_cols: list[str]) -> ColumnTr
         ("cat", categorical, cat_cols),
     ])
     return ColumnTransformer(transformers)
+
+
+def build_model_prep_pipeline(
+    numeric_cols: list[str], cat_cols: list[str]
+) -> Pipeline:
+    """Build full preprocessing pipeline: TimeAugmenter + ColumnTransformer."""
+    return Pipeline([
+        ("time_aug", TimeAugmenter()),
+        ("prep", build_preprocessor(numeric_cols, cat_cols)),
+    ])
+
+
+def run_preprocess() -> None:
+    """Produce model_features.parquet and model_preprocessor.joblib. Run once before 06/07."""
+    from pathlib import Path
+    from joblib import dump
+
+    project_root = Path(__file__).resolve().parent.parent
+    in_path = project_root / "data" / "processed" / "hazard_features.parquet"
+    out_path = project_root / "data" / "processed" / "model_features.parquet"
+    preproc_path = project_root / "data" / "processed" / "model_preprocessor.joblib"
+
+    if not in_path.exists():
+        raise FileNotFoundError(f"Run 03_features.py first: {in_path} not found")
+
+    df = pd.read_parquet(in_path)
+    add_slot_imputed_indicators(df)
+
+    numeric_cols, cat_cols = build_feature_lists(df)
+    pipeline = build_model_prep_pipeline(numeric_cols, cat_cols)
+
+    X_raw = df[numeric_cols + cat_cols]
+    X_processed = pipeline.fit_transform(X_raw)
+
+    feature_names = pipeline.named_steps["prep"].get_feature_names_out()
+    out_df = pd.DataFrame(X_processed, columns=list(feature_names))
+    for col in ["fc_sequence_id", "sl_event_id", "event_t", "terminal_failure_t"]:
+        out_df[col] = df[col].values
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_df.to_parquet(out_path, index=False)
+    dump(pipeline, preproc_path)
+
+    print(f"Saved {out_path} ({len(out_df):,} rows)")
+    print(f"Saved {preproc_path}")
+
+
+if __name__ == "__main__":
+    run_preprocess()
