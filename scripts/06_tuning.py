@@ -15,10 +15,17 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+from sklearn.base import clone
 from sklearn.metrics import classification_report, log_loss
 from sklearn.ensemble import GradientBoostingClassifier, HistGradientBoostingClassifier
-from sklearn.model_selection import GroupKFold, GroupShuffleSplit, RandomizedSearchCV
+from sklearn.model_selection import (
+    GroupKFold,
+    GroupShuffleSplit,
+    ParameterSampler,
+    cross_val_score,
+)
 from sklearn.pipeline import Pipeline
+from tqdm import tqdm
 
 import xgboost as xgb
 
@@ -159,26 +166,40 @@ def main() -> None:
 
     for name, estimator, param_dist in configs:
         print(f"\n{'='*60}")
-        print(f"Tuning {name} (RandomizedSearchCV, n_iter={n_iter})")
+        print(f"Tuning {name} ({n_iter} candidates × {N_CV_FOLDS} folds)")
         print("=" * 60)
 
-        search = RandomizedSearchCV(
-            estimator,
-            param_distributions=param_dist,
-            n_iter=n_iter,
-            cv=cv,
-            scoring="neg_log_loss",
-            n_jobs=N_JOBS,
-            random_state=RANDOM_STATE,
-            refit=True,
-            verbose=1,
+        param_list = list(
+            ParameterSampler(
+                param_dist, n_iter=n_iter, random_state=RANDOM_STATE
+            )
         )
+        best_cv_score = -np.inf
+        best_params: dict | None = None
 
-        search.fit(X_train, y_train, groups=groups)
+        for params in tqdm(param_list, desc=name, unit="candidate", leave=False):
+            est = clone(estimator)
+            est.set_params(**params)
+            scores = cross_val_score(
+                est,
+                X_train,
+                y_train,
+                cv=cv,
+                groups=groups,
+                scoring="neg_log_loss",
+                n_jobs=N_JOBS,
+            )
+            mean_score = scores.mean()
+            if mean_score > best_cv_score:
+                best_cv_score = mean_score
+                best_params = params
 
-        cv_ll = -search.best_score_
-        best_params = search.best_params_
-        proba = search.best_estimator_.predict_proba(X_test)
+        cv_ll = -best_cv_score
+        best_estimator = clone(estimator)
+        best_estimator.set_params(**best_params)
+        best_estimator.fit(X_train, y_train)
+
+        proba = best_estimator.predict_proba(X_test)
         test_ll = log_loss(y_test, proba, labels=[0, 1, 2])
         pred = np.argmax(proba, axis=1)
 
