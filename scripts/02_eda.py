@@ -23,8 +23,11 @@ import pandas as pd
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DATA_DIR = PROJECT_ROOT / "data" / "raw"
 PROCESSED_DIR = PROJECT_ROOT / "data" / "processed"
+RESULTS_DIR = PROJECT_ROOT / "data" / "results"
 PLOTS_DIR = PROJECT_ROOT / "plots"
 JP_DIR = PROJECT_ROOT / "jp"
+
+FORECHECK_SLOTS = ["F1", "F2", "F3", "F4", "F5"]
 
 # Rink dimensions (x: -100 to 100, y: -42.5 to 42.5)
 RINK_X = (-100, 100)
@@ -345,9 +348,278 @@ def save_longest_presses(interval_ms: int = 350) -> None:
         _save_press_gif(ev, tr, PLOTS_DIR / f"{name}.gif", title_prefix=title, interval_ms=interval_ms, x_min=-40)
 
 
+#####################################
+### ATTRIBUTION & CONTRIBUTION EDA ###
+#####################################
+
+def slot_change_audit() -> None:
+    """Fraction of sequences where any slot_id changes across rows (stint relevance)."""
+    path = PROCESSED_DIR / "hazard_features.parquet"
+    if not path.exists():
+        print("slot_change_audit: hazard_features.parquet not found (run 03_features.py)")
+        return
+
+    df = pd.read_parquet(path)
+    slot_ids = [f"{s}_id" for s in FORECHECK_SLOTS if f"{s}_id" in df.columns]
+    if not slot_ids:
+        print("slot_change_audit: no slot_id columns found")
+        return
+
+    frac_changing = (
+        df.groupby("fc_sequence_id")[slot_ids]
+        .nunique(dropna=False)
+        .gt(1)
+        .any(axis=1)
+        .mean()
+    )
+    print("Slot-change audit (stint attribution relevance):")
+    print(f"  Fraction of sequences with slot changes (any slot): {frac_changing:.4f}")
+
+
+def attribution_spreads() -> None:
+    """% positive, negative, zero for each attribution method and modeling columns."""
+    print("\n--- Attribution spreads ---")
+
+    # Participation
+    p_path = RESULTS_DIR / "participation.csv"
+    if p_path.exists():
+        p = pd.read_csv(p_path)
+        if "n_presses" in p.columns and "n_press" not in p.columns:
+            p = p.rename(columns={"n_presses": "n_press"})
+        col = "total"
+        s = p[col].dropna()
+        n = len(s)
+        if n > 0:
+            pos, neg, zero = (s > 0).sum(), (s < 0).sum(), (s == 0).sum()
+            print(f"\nParticipation ({col}): + {100*pos/n:.1f}% ({pos:,}) | - {100*neg/n:.1f}% ({neg:,}) | 0 {100*zero/n:.1f}%")
+
+    # Distance
+    d_path = RESULTS_DIR / "distance.csv"
+    if d_path.exists():
+        d = pd.read_csv(d_path)
+        if "n_presses" in d.columns and "n_press" not in d.columns:
+            d = d.rename(columns={"n_presses": "n_press"})
+        col = "total"
+        s = d[col].dropna()
+        n = len(s)
+        if n > 0:
+            pos, neg, zero = (s > 0).sum(), (s < 0).sum(), (s == 0).sum()
+            print(f"Distance ({col}): + {100*pos/n:.1f}% ({pos:,}) | - {100*neg/n:.1f}% ({neg:,}) | 0 {100*zero/n:.1f}%")
+
+    # Modeling
+    m_path = RESULTS_DIR / "modeling.csv"
+    if m_path.exists():
+        m = pd.read_csv(m_path)
+        for col in ["pos_total", "exec_total", "check_total"]:
+            if col not in m.columns:
+                continue
+            s = m[col].dropna()
+            n = len(s)
+            if n > 0:
+                pos, neg, zero = (s > 0).sum(), (s < 0).sum(), (s == 0).sum()
+                print(f"Modeling ({col}): + {100*pos/n:.1f}% ({pos:,}) | - {100*neg/n:.1f}% ({neg:,}) | 0 {100*zero/n:.1f}%")
+
+
+def contribution_distributions() -> None:
+    """Histograms of modeling contribution columns (pos_total, exec_total, check_total)."""
+    path = RESULTS_DIR / "modeling.csv"
+    if not path.exists():
+        print("contribution_distributions: modeling.csv not found (run 07_modeling.py)")
+        return
+
+    m = pd.read_csv(path)
+    cols = [c for c in ["pos_total", "exec_total", "check_total"] if c in m.columns]
+    if not cols:
+        return
+
+    PLOTS_DIR.mkdir(parents=True, exist_ok=True)
+    fig, axes = plt.subplots(1, len(cols), figsize=(4 * len(cols), 4))
+    if len(cols) == 1:
+        axes = [axes]
+
+    for ax, col in zip(axes, cols):
+        s = m[col].dropna()
+        ax.hist(s, bins=50, edgecolor="white", linewidth=0.5)
+        ax.axvline(0, color="black", linestyle="--", alpha=0.7)
+        ax.set_title(col)
+        ax.set_xlabel("value")
+
+    plt.suptitle("Modeling contribution distributions (player-level)")
+    plt.tight_layout()
+    out = PLOTS_DIR / "modeling_contribution_distributions.png"
+    plt.savefig(out, dpi=150)
+    plt.close()
+    print(f"Saved: {out}")
+
+
+def player_rankings_visual(top_n: int = 20) -> None:
+    """Bar charts of top players by each attribution method."""
+    paths = {
+        "participation": (RESULTS_DIR / "participation.csv", "total"),
+        "distance": (RESULTS_DIR / "distance.csv", "total"),
+        "modeling": (RESULTS_DIR / "modeling.csv", "check_total"),
+    }
+    dfs = {}
+    for name, (p, total_col) in paths.items():
+        if p.exists():
+            df = pd.read_csv(p)
+            if "n_presses" in df.columns and "n_press" not in df.columns:
+                df = df.rename(columns={"n_presses": "n_press"})
+            if total_col not in df.columns and name == "modeling":
+                total_col = "total"
+            if total_col in df.columns and "player_name" in df.columns:
+                dfs[name] = df.nlargest(top_n, total_col)[["player_name", total_col]]
+
+    if not dfs:
+        print("player_rankings_visual: no result CSVs found")
+        return
+
+    methods = list(dfs.keys())
+    PLOTS_DIR.mkdir(parents=True, exist_ok=True)
+    fig, axes = plt.subplots(len(methods), 1, figsize=(10, 3 * len(methods)))
+    if len(methods) == 1:
+        axes = [axes]
+
+    for ax, method in zip(axes, methods):
+        sub = dfs[method]
+        val_col = [c for c in sub.columns if c != "player_name"][0]
+        ax.barh(range(len(sub)), sub[val_col].values)
+        ax.set_yticks(range(len(sub)))
+        ax.set_yticklabels(sub["player_name"].values, fontsize=9)
+        ax.invert_yaxis()
+        ax.set_title(f"Top {top_n} — {method}")
+        ax.axvline(0, color="black", linestyle="-", linewidth=0.5)
+        ax.set_xlabel(val_col)
+
+    plt.suptitle("Player rankings by attribution method")
+    plt.tight_layout()
+    out = PLOTS_DIR / "player_rankings.png"
+    plt.savefig(out, dpi=150)
+    plt.close()
+    print(f"Saved: {out}")
+
+
+def player_press_distributions() -> None:
+    """Possession-level spread of pos/exec/total from player_press.parquet."""
+    path = RESULTS_DIR / "player_press.parquet"
+    if not path.exists():
+        print("player_press_distributions: player_press.parquet not found (run 07_modeling.py)")
+        return
+
+    pp = pd.read_parquet(path)
+    for col, name in [
+        ("positioning", "pos"),
+        ("execution", "exec"),
+        ("total_in_press", "total"),
+    ]:
+        if col not in pp.columns:
+            continue
+        s = pp[col].dropna()
+        if len(s) == 0:
+            continue
+        print(f"\n{name} (possession): mean={s.mean():.4f}, median={s.median():.4f}, "
+              f"pct_pos={100*(s>0).mean():.1f}%, n={len(s):,}")
+
+    if "execution" in pp.columns:
+        ex = pp["execution"]
+        pos_vals = ex[ex > 0]
+        neg_vals = ex[ex < 0]
+        if len(pos_vals) > 0 and len(neg_vals) > 0:
+            print(f"\nexec magnitude: mean(pos)={pos_vals.mean():.4f}, mean(neg)={neg_vals.mean():.4f}")
+
+    n_press_per_player = pp.groupby("player_id").size()
+    pp = pp.copy()
+    pp["player_n_press"] = pp["player_id"].map(n_press_per_player)
+    high = pp["player_n_press"] > 10
+    low = pp["player_n_press"] <= 10
+    if high.sum() > 0:
+        sh = pp.loc[high, "execution"]
+        print(f"exec from high-n (n_press>10): n={high.sum():,}, pct_pos={100*(sh>0).mean():.1f}%")
+    if low.sum() > 0:
+        sl = pp.loc[low, "execution"]
+        print(f"exec from low-n (n_press<=10): n={low.sum():,}, pct_pos={100*(sl>0).mean():.1f}%")
+
+
+def ranking_comparison_scatter() -> None:
+    """Scatter: modeling vs participation and modeling vs distance (top players)."""
+    paths = {
+        "participation": RESULTS_DIR / "participation.csv",
+        "distance": RESULTS_DIR / "distance.csv",
+        "modeling": RESULTS_DIR / "modeling.csv",
+    }
+    dfs = {}
+    for name, p in paths.items():
+        if not p.exists():
+            continue
+        df = pd.read_csv(p)
+        if "n_presses" in df.columns:
+            df = df.rename(columns={"n_presses": "n_press"})
+        total_col = "check_total" if name == "modeling" and "check_total" in df.columns else "total"
+        if total_col in df.columns:
+            dfs[name] = df[["player_id", total_col]].rename(columns={total_col: name})
+
+    if "modeling" not in dfs or len(dfs) < 2:
+        print("ranking_comparison_scatter: need modeling + at least one other method")
+        return
+
+    m = dfs["modeling"]
+    for other in ["participation", "distance"]:
+        if other not in dfs:
+            continue
+        merged = m.merge(dfs[other], on="player_id", how="inner")
+        if len(merged) < 5:
+            continue
+
+        fig, ax = plt.subplots(figsize=(8, 8))
+        ax.scatter(merged[other], merged["modeling"], alpha=0.6)
+        ax.axhline(0, color="gray", linestyle="--")
+        ax.axvline(0, color="gray", linestyle="--")
+        ax.set_xlabel(other)
+        ax.set_ylabel("modeling")
+        ax.set_title(f"Modeling vs {other} (player totals)")
+        plt.tight_layout()
+        out = PLOTS_DIR / f"ranking_comparison_modeling_vs_{other}.png"
+        PLOTS_DIR.mkdir(parents=True, exist_ok=True)
+        plt.savefig(out, dpi=150)
+        plt.close()
+        print(f"Saved: {out}")
+
+
 def main() -> None:
-    possession_time_vs_recovery()
-    save_longest_presses(interval_ms=350)
+    import argparse
+    parser = argparse.ArgumentParser(description="EDA for forecheck analysis")
+    parser.add_argument("--all", action="store_true", help="Run all EDA (default)")
+    parser.add_argument("--possession", action="store_true", help="Possession time vs recovery")
+    parser.add_argument("--gifs", action="store_true", help="Save longest press GIFs")
+    parser.add_argument("--slot-audit", action="store_true", help="Slot-change audit")
+    parser.add_argument("--spreads", action="store_true", help="Attribution positive/negative spreads")
+    parser.add_argument("--distributions", action="store_true", help="Modeling contribution histograms")
+    parser.add_argument("--rankings", action="store_true", help="Top player bar charts")
+    parser.add_argument("--player-press", action="store_true", help="Possession-level credit stats")
+    parser.add_argument("--scatter", action="store_true", help="Modeling vs participation/distance scatter")
+    args = parser.parse_args()
+
+    run_all = args.all or not any([
+        args.possession, args.gifs, args.slot_audit, args.spreads,
+        args.distributions, args.rankings, args.player_press, args.scatter,
+    ])
+
+    if run_all or args.possession:
+        possession_time_vs_recovery()
+    if run_all or args.gifs:
+        save_longest_presses(interval_ms=350)
+    if run_all or args.slot_audit:
+        slot_change_audit()
+    if run_all or args.spreads:
+        attribution_spreads()
+    if run_all or args.distributions:
+        contribution_distributions()
+    if run_all or args.rankings:
+        player_rankings_visual()
+    if run_all or args.player_press:
+        player_press_distributions()
+    if run_all or args.scatter:
+        ranking_comparison_scatter()
 
 
 if __name__ == "__main__":
