@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Train competing-risk hazard models for forecheck outcomes.
 
-Uses the best model from tuning_results.csv (06_tuning.py) when available;
+Uses the best model from tuning_full.csv or tuning_quick.csv (06_tuning.py) when available;
 otherwise trains and compares logit, RandomForest, HistGradientBoosting, and XGBoost.
 
 Target classes:
@@ -55,6 +55,8 @@ _preprocess_path = Path(__file__).resolve().parent / "05_preprocess.py"
 _spec = importlib.util.spec_from_file_location("preprocess", _preprocess_path)
 _preprocess = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_preprocess)
+# Register TimeAugmenter so joblib can unpickle the preprocessor (pickled when 05 ran as __main__)
+sys.modules["__main__"].TimeAugmenter = _preprocess.TimeAugmenter
 FORECHECK_SLOTS = _preprocess.FORECHECK_SLOTS
 SLOT_FEATURE_TEMPLATE = _preprocess.SLOT_FEATURE_TEMPLATE
 add_slot_imputed_indicators = _preprocess.add_slot_imputed_indicators
@@ -91,13 +93,17 @@ def split_groups(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
 
 
 def load_tuned_params() -> dict[str, dict]:
-    """Load best hyperparameters from tuning_results.csv (from 06_tuning.py).
+    """Load best hyperparameters from tuning file (from 06_tuning.py).
 
-    Returns dict mapping model name to param dict (without model__ prefix).
-    Model names: rf, hist_gbm, xgboost. Falls back to empty dict if file missing.
+    Tries tuning_full.csv first, then tuning_quick.csv. Returns dict mapping
+    model name to param dict (without model__ prefix). Model names: rf, hist_gbm, xgboost.
+    Falls back to empty dict if neither file exists.
     """
-    path = RESULTS_DIR / "tuning_results.csv"
-    if not path.exists():
+    for fname in ("tuning_full.csv", "tuning_quick.csv"):
+        path = RESULTS_DIR / fname
+        if path.exists():
+            break
+    else:
         return {}
     df = pd.read_csv(path)
     if df.empty:
@@ -115,13 +121,19 @@ def load_tuned_params() -> dict[str, dict]:
 
 
 def load_best_model_from_tuning() -> tuple[str, dict] | None:
-    """Load best model name and params from tuning_results.csv (sorted by test_log_loss).
+    """Load best model name and params from tuning file (sorted by test_log_loss).
 
-    Returns (model_name, params) or None if tuning_results missing/empty.
+    Tries tuning_full.csv first, then tuning_quick.csv.
+    Returns (model_name, params) or None if neither file exists/empty.
     Model names: rf, hist_gbm, xgboost.
     """
-    path = RESULTS_DIR / "tuning_results.csv"
-    if not path.exists():
+    path = None
+    for fname in ("tuning_full.csv", "tuning_quick.csv"):
+        p = RESULTS_DIR / fname
+        if p.exists():
+            path = p
+            break
+    if path is None:
         return None
     df = pd.read_csv(path)
     if df.empty or "model" not in df.columns:
@@ -875,7 +887,7 @@ def main() -> None:
     tuning_choice = load_best_model_from_tuning()
     if tuning_choice is not None:
         best_model_name, best_params = tuning_choice
-        print(f"\n[2/5] Training {best_model_name} (from tuning_results.csv)...")
+        print(f"\n[2/5] Training {best_model_name} (from tuning file)...")
         est = _build_estimator(best_model_name, best_params)
         est.fit(X_train, y_train)
         pipe = _wrap_for_prediction(est, preprocessor_pipeline)
@@ -889,7 +901,7 @@ def main() -> None:
             "mean_failure_hazard": float(proba[:, 2].mean()),
         }])
     else:
-        print("\n[2/5] Training hazard models (no tuning_results.csv; comparing all)...")
+        print("\n[2/5] Training hazard models (no tuning file; comparing all)...")
         tuned = load_tuned_params()
         hist_defaults = {"max_depth": 8, "learning_rate": 0.05, "max_iter": 300}
         rf_defaults = {"n_estimators": 300, "max_depth": 10, "min_samples_leaf": 10}
