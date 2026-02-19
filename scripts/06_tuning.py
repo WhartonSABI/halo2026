@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Gradient-boosting hyperparameter tuning for forecheck hazard prediction.
+"""Hyperparameter tuning for forecheck hazard prediction.
 
-Tunes HistGradientBoosting, GradientBoosting, and XGBoost via RandomizedSearchCV
+Tunes RandomForest, HistGradientBoosting, and XGBoost via ParameterSampler
 with group-based cross-validation (by fc_sequence_id).
 
 Target: 3-class classification (ongoing=0, success=1, failure=2); metric = log loss.
@@ -11,37 +11,34 @@ from __future__ import annotations
 
 import argparse
 import os
+import warnings
 from pathlib import Path
+
+warnings.filterwarnings(
+    "ignore",
+    message=".*sklearn.utils.parallel.delayed.*",
+)
 
 import numpy as np
 import pandas as pd
 from sklearn.base import clone
 from sklearn.metrics import classification_report, log_loss
-from sklearn.ensemble import GradientBoostingClassifier, HistGradientBoostingClassifier
+from sklearn.ensemble import HistGradientBoostingClassifier, RandomForestClassifier
 from sklearn.model_selection import (
     GroupKFold,
     GroupShuffleSplit,
     ParameterSampler,
     cross_val_score,
 )
-from sklearn.pipeline import Pipeline
 from tqdm import tqdm
 
 import xgboost as xgb
 
-import importlib.util
-_preprocess_path = Path(__file__).resolve().parent / "05_preprocess.py"
-_spec = importlib.util.spec_from_file_location("preprocess", _preprocess_path)
-_preprocess = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(_preprocess)
-TimeAugmenter = _preprocess.TimeAugmenter
-add_slot_imputed_indicators = _preprocess.add_slot_imputed_indicators
-build_feature_lists = _preprocess.build_feature_lists
-build_preprocessor = _preprocess.build_preprocessor
-
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-DATA_PATH = PROJECT_ROOT / "data" / "processed" / "hazard_features.parquet"
+DATA_PATH = PROJECT_ROOT / "data" / "processed" / "model_features.parquet"
 RESULTS_DIR = PROJECT_ROOT / "data" / "results"
+
+META_COLS = {"fc_sequence_id", "sl_event_id", "event_t", "terminal_failure_t", "target_class"}
 
 RANDOM_STATE = 7
 N_CV_FOLDS = 5
@@ -50,13 +47,22 @@ N_JOBS = max(1, (os.cpu_count() or 1) - 1)  # all cores minus one
 
 
 def load_data() -> pd.DataFrame:
-    """Load hazard features and define 3-class target."""
+    """Load preprocessed model features and define 3-class target."""
+    if not DATA_PATH.exists():
+        raise FileNotFoundError(
+            f"Run 05_preprocess.py first to create {DATA_PATH}"
+        )
     df = pd.read_parquet(DATA_PATH)
     y = np.zeros(len(df), dtype=np.int64)
     y[df["event_t"].eq(1).values] = 1
     y[df["terminal_failure_t"].eq(1).values] = 2
     df["target_class"] = y
     return df
+
+
+def _feature_columns(df: pd.DataFrame) -> list[str]:
+    """Column names for model input (excludes metadata)."""
+    return [c for c in df.columns if c not in META_COLS]
 
 
 def split_groups(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -66,69 +72,56 @@ def split_groups(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
     return df.iloc[tr_idx].copy(), df.iloc[te_idx].copy()
 
 
-def get_model_configs(preprocessor) -> list[tuple[str, Pipeline, dict]]:
-    """Return list of (name, estimator, param_distributions) for tuning."""
-    time_aug = TimeAugmenter()
-    configs: list[tuple[str, Pipeline, dict]] = []
+def get_model_configs() -> list[tuple[str, object, dict]]:
+    """Return list of (name, estimator, param_distributions) for tuning.
+    Estimators expect preprocessed X from model_features.parquet.
+    """
+    configs: list[tuple[str, object, dict]] = []
 
-    # HistGradientBoosting (histogram-based GBM)
+    # RandomForest
     configs.append((
-        "hist_gbm",
-        Pipeline([
-            ("time_aug", time_aug),
-            ("prep", preprocessor),
-            ("model", HistGradientBoostingClassifier(random_state=RANDOM_STATE)),
-        ]),
+        "rf",
+        RandomForestClassifier(random_state=RANDOM_STATE, n_jobs=-1),
         {
-            "model__max_depth": [4, 6, 8, 10, 12],
-            "model__learning_rate": [0.01, 0.03, 0.05, 0.1],
-            "model__max_iter": [200, 300, 500, 800],
-            "model__min_samples_leaf": [10, 20, 50],
-            "model__l2_regularization": [0.0, 0.1, 1.0],
-            "model__max_bins": [128, 255],
+            "n_estimators": [100, 200, 300, 500],
+            "max_depth": [4, 6, 8, 10, 12, None],
+            "min_samples_leaf": [5, 10, 20],
+            "max_features": ["sqrt", "log2", None],
         },
     ))
 
-    # GradientBoosting (traditional sklearn GBM)
+    # HistGradientBoosting
     configs.append((
-        "gbm",
-        Pipeline([
-            ("time_aug", time_aug),
-            ("prep", preprocessor),
-            ("model", GradientBoostingClassifier(random_state=RANDOM_STATE)),
-        ]),
+        "hist_gbm",
+        HistGradientBoostingClassifier(random_state=RANDOM_STATE),
         {
-            "model__max_depth": [4, 6, 8, 10],
-            "model__learning_rate": [0.01, 0.03, 0.05, 0.1],
-            "model__n_estimators": [100, 200, 300, 500],
-            "model__min_samples_leaf": [5, 10, 20],
-            "model__subsample": [0.7, 0.8, 1.0],
-            "model__max_features": ["sqrt", "log2", None],
+            "max_depth": [4, 6, 8, 10, 12],
+            "learning_rate": [0.01, 0.03, 0.05, 0.1],
+            "max_iter": [200, 300, 500, 800],
+            "min_samples_leaf": [10, 20, 50],
+            "l2_regularization": [0.0, 0.1, 1.0],
+            "max_bins": [128, 255],
         },
     ))
 
     # XGBoost
     configs.append((
         "xgboost",
-        Pipeline([
-            ("time_aug", time_aug),
-            ("prep", preprocessor),
-            ("model", xgb.XGBClassifier(
-                objective="multi:softprob",
-                num_class=3,
-                random_state=RANDOM_STATE,
-                n_jobs=-1,
-            )),
-        ]),
+        xgb.XGBClassifier(
+            objective="multi:softprob",
+            num_class=3,
+            random_state=RANDOM_STATE,
+            n_jobs=-1,
+        ),
         {
-            "model__max_depth": [4, 6, 8, 10],
-            "model__learning_rate": [0.01, 0.03, 0.05, 0.1],
-            "model__n_estimators": [200, 300, 500, 800],
-            "model__min_child_weight": [1, 3, 5],
-            "model__subsample": [0.7, 0.8, 1.0],
-            "model__colsample_bytree": [0.7, 0.8, 1.0],
-            "model__reg_alpha": [0.0, 0.1, 1.0],
-            "model__reg_lambda": [0.1, 1.0, 10.0],
+            "max_depth": [4, 6, 8, 10],
+            "learning_rate": [0.01, 0.03, 0.05, 0.1],
+            "n_estimators": [200, 300, 500, 800],
+            "min_child_weight": [1, 3, 5],
+            "subsample": [0.7, 0.8, 1.0],
+            "colsample_bytree": [0.7, 0.8, 1.0],
+            "reg_alpha": [0.0, 0.1, 1.0],
+            "reg_lambda": [0.1, 1.0, 10.0],
         },
     ))
 
@@ -136,29 +129,26 @@ def get_model_configs(preprocessor) -> list[tuple[str, Pipeline, dict]]:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Gradient-boosting hyperparameter tuning for forecheck hazard prediction")
-    parser.add_argument("--quick", action="store_true", help="Use 10 iterations per model for fast testing")
+    parser = argparse.ArgumentParser(description="Hyperparameter tuning (RF, HistGBM, XGBoost) for forecheck hazard prediction")
+    parser.add_argument("--full", action="store_true", help="Use 50 iterations per model (default: 10)")
     args = parser.parse_args()
 
-    n_iter = 10 if args.quick else N_ITER_RANDOM
-    if args.quick:
-        print("Quick mode: 10 iterations per model")
+    n_iter = N_ITER_RANDOM if args.full else 10
+    if not args.full:
+        print("Quick mode: 10 iterations per model (use --full for 50)")
 
     print("Loading data...")
     df = load_data()
-    add_slot_imputed_indicators(df)
     train_df, test_df = split_groups(df)
 
-    numeric_cols, cat_cols = build_feature_lists(df)
-    preprocessor = build_preprocessor(numeric_cols, cat_cols)
-
-    X_train = train_df[numeric_cols + cat_cols]
+    feat_cols = _feature_columns(df)
+    X_train = train_df[feat_cols]
     y_train = train_df["target_class"]
-    X_test = test_df[numeric_cols + cat_cols]
+    X_test = test_df[feat_cols]
     y_test = test_df["target_class"]
     groups = train_df["fc_sequence_id"].values
 
-    configs = get_model_configs(preprocessor)
+    configs = get_model_configs()
     cv = GroupKFold(n_splits=N_CV_FOLDS)
     all_results: list[dict] = []
     best_loss = np.inf
