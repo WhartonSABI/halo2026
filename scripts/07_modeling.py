@@ -16,18 +16,17 @@ Key modeling choice:
   expansions (log-time and spline basis), so each model learns hazard as a
   function of elapsed continuous time.
 
-Player crediting logic (value of a press):
-- For each hazard row, define press value = P(success) - P(failure).
-- For each forechecker slot F1..F5, compute a leave-one-out counterfactual by
-  replacing slot features with a ghost: sample from same RF leaf.
-- Slot credit on the row is the drop in press value under this counterfactual.
-  Positive credit means that player's pressure increased expected success
-  relative to failure.
-- Aggregate row credits to player-level totals/means for valuation.
+Player crediting logic (possession-level value):
+- Attribution uses P(success) - P(failure) over the whole possession (CIF, cumulative incidence).
+- For each forechecker slot, compute leave-one-out counterfactual: replace slot with ghost from RF leaf.
+- Credit = drop in possession-level (CIF_success - CIF_failure) under counterfactual.
+- Positioning = effect of start-row slot; execution = effect of non-start rows.
+- Aggregate to player-level totals and per-press rates for valuation.
 """
 
 from __future__ import annotations
 
+import argparse
 import ast
 import os
 import sys
@@ -141,6 +140,33 @@ def _get_slot_cols(slot: str, df: pd.DataFrame) -> list[str]:
     return [c.format(slot=slot) for c in SLOT_FEATURE_TEMPLATE if c.format(slot=slot) in df.columns]
 
 
+def _compute_start_meta(
+    df: pd.DataFrame, time_col: str = "time_since_start_s"
+) -> tuple[pd.Series, np.ndarray]:
+    """Compute start_index (fc_sequence_id -> row index) and is_start_row (bool per row)."""
+    ordering = pd.DataFrame(
+        {
+            "fc_sequence_id": df["fc_sequence_id"].values,
+            "time_since_start_s": df[time_col].astype(float).values,
+            "sl_event_id": df["sl_event_id"].values,
+        },
+        index=df.index,
+    )
+    start_rows = (
+        ordering.sort_values(["fc_sequence_id", "time_since_start_s", "sl_event_id"])
+        .groupby("fc_sequence_id", as_index=False)
+        .first()[["fc_sequence_id", "time_since_start_s", "sl_event_id"]]
+    )
+    start_index = (
+        ordering.reset_index()
+        .merge(start_rows, on=["fc_sequence_id", "time_since_start_s", "sl_event_id"], how="inner")
+        .drop_duplicates(subset=["fc_sequence_id"])
+        .set_index("fc_sequence_id")["index"]
+    )
+    is_start_row = np.asarray(df.index.isin(start_index.values), dtype=bool)
+    return start_index, is_start_row
+
+
 class LeafResampleGhost:
     """Sample from conditional empirical distribution via RF leaf resampling."""
 
@@ -194,13 +220,17 @@ def fit_slot_predictors(
     X_train: pd.DataFrame,
     numeric_cols: list[str],
     cat_cols: list[str],
-) -> dict[str, tuple[Pipeline, LeafResampleGhost, list[str]]]:
+    is_start_row: np.ndarray,
+) -> dict[str, tuple[Pipeline, LeafResampleGhost, LeafResampleGhost, list[str]]]:
     """Fit one multi-output RF per slot: predict slot features from X_without_slot.
 
-    Uses leaf-resampling ghosts: sample from same RF leaf (any training row).
-    Returns dict[slot] -> (pipeline, ghost, input_cols).
+    Trains two ghost samplers per slot:
+    - ghost_start: trained only on sequence-start rows (for positioning credit)
+    - ghost_exec: trained on non-start rows (for execution credit)
+
+    Returns dict[slot] -> (pipeline, ghost_start, ghost_exec, input_cols).
     """
-    slot_predictors: dict[str, tuple[Pipeline, LeafResampleGhost, list[str]]] = {}
+    slot_predictors: dict[str, tuple[Pipeline, LeafResampleGhost, LeafResampleGhost, list[str]]] = {}
     rf_params = dict(n_estimators=100, max_depth=8, random_state=RANDOM_STATE, n_jobs=-1)
 
     for slot in tqdm(FORECHECK_SLOTS, desc="Slot predictors", unit="slot", file=sys.stdout):
@@ -220,6 +250,7 @@ def fit_slot_predictors(
             continue
         X_in = X_train.loc[valid, input_cols]
         y_out = y_out.loc[valid]
+        start_mask = np.asarray(is_start_row, dtype=bool)[valid.values]
 
         input_numeric = [c for c in input_cols if c in numeric_cols]
         input_cat = [c for c in input_cols if c in cat_cols]
@@ -244,37 +275,94 @@ def fit_slot_predictors(
         ])
         pipeline.fit(X_in, y_out)
         preprocess = pipeline.named_steps["preprocess"]
-        rf = pipeline.named_steps["rf"]
         X_processed = preprocess.transform(X_in)
         if hasattr(X_processed, "toarray"):
             X_processed = X_processed.toarray()
-        ghost = LeafResampleGhost(
-            rf,
-            y_out.to_numpy(),
-            np.asarray(X_processed),
-            np.random.default_rng(RANDOM_STATE),
-        )
-        slot_predictors[slot] = (pipeline, ghost, input_cols)
+        X_processed = np.asarray(X_processed)
+
+        # ghost_start: trained only on sequence-start rows
+        start_valid = start_mask
+        if start_valid.sum() >= 30:
+            X_start = X_processed[start_valid]
+            y_start = y_out.iloc[start_valid].to_numpy()
+            rf_start = RandomForestRegressor(**rf_params).fit(X_start, y_start)
+            ghost_start = LeafResampleGhost(rf_start, y_start, X_start, np.random.default_rng(RANDOM_STATE))
+        else:
+            rf_all = pipeline.named_steps["rf"]
+            ghost_start = LeafResampleGhost(rf_all, y_out.to_numpy(), X_processed, np.random.default_rng(RANDOM_STATE))
+
+        # ghost_exec: trained on non-start rows
+        exec_mask = ~start_mask
+        if exec_mask.sum() >= 30:
+            X_exec = X_processed[exec_mask]
+            y_exec = y_out.iloc[exec_mask].to_numpy()
+            rf_exec = RandomForestRegressor(**rf_params).fit(X_exec, y_exec)
+            ghost_exec = LeafResampleGhost(
+                rf_exec, y_exec, X_exec, np.random.default_rng(RANDOM_STATE + 1)
+            )
+        else:
+            rf_all = pipeline.named_steps["rf"]
+            ghost_exec = LeafResampleGhost(
+                rf_all, y_out.to_numpy(), X_processed, np.random.default_rng(RANDOM_STATE + 1)
+            )
+
+        slot_predictors[slot] = (pipeline, ghost_start, ghost_exec, input_cols)
 
     return slot_predictors
 
 
-def _rf_slot_replacement(
-    df: pd.DataFrame,
-    slot: str,
-    slot_predictor: tuple[Pipeline, LeafResampleGhost, list[str]] | None,
-) -> tuple[pd.DataFrame, np.ndarray]:
-    """Counterfactual: replace slot features with ghost from same leaf.
+def _compute_cif(
+    proba: np.ndarray,
+    fc_sequence_id: np.ndarray | pd.Series,
+    source_df: pd.DataFrame,
+) -> pd.DataFrame:
+    """Cumulative incidence of success and failure over each possession.
 
-    Preserves missingness pattern: only overwrites values that were originally observed,
-    leaves NaNs as NaNs so base and CF have identical missing indicators.
+    proba: (n_rows, 3) with columns [ongoing, success, failure]
+    Returns DataFrame with fc_sequence_id, cif_success, cif_failure.
+    """
+    df = source_df.copy()
+    df["_h_success"] = proba[:, 1]
+    df["_h_failure"] = proba[:, 2]
+    df["_h_ongoing"] = 1 - df["_h_success"] - df["_h_failure"]
+    out = []
+    for seq_id, grp in df.groupby("fc_sequence_id", sort=False):
+        grp = grp.sort_values(["time_since_start_s", "sl_event_id"])
+        h_s = grp["_h_success"].values
+        h_f = grp["_h_failure"].values
+        S = 1.0
+        cif_s = 0.0
+        cif_f = 0.0
+        for t in range(len(grp)):
+            cif_s += h_s[t] * S
+            cif_f += h_f[t] * S
+            S *= 1 - h_s[t] - h_f[t]
+            if S <= 0:
+                break
+        out.append({"fc_sequence_id": seq_id, "cif_success": cif_s, "cif_failure": cif_f})
+    return pd.DataFrame(out)
+
+
+def _rf_slot_replacement(
+    X_filled: pd.DataFrame,
+    X_raw: pd.DataFrame,
+    slot: str,
+    slot_predictor: tuple[Pipeline, LeafResampleGhost, LeafResampleGhost, list[str]] | None,
+    is_start_row: np.ndarray,
+    replace_start_only: bool = False,
+) -> tuple[pd.DataFrame, np.ndarray]:
+    """Counterfactual: replace observed slot features with ghost from same leaf.
+
+    Starts from X_filled (all NaNs filled). Uses X_raw to determine which positions
+    were originally observed. Only overwrites observed positions with ghost values.
+    Missing entries stay as RF fill in both base and CF - no asymmetry.
 
     Returns (cf, valid_mask). valid_mask[i]=True where we found a sample.
     """
-    cf = df.copy()
+    cf = X_filled.copy()
     slot_id = f"{slot}_id"
-    slot_cols = _get_slot_cols(slot, df)
-    n = len(df)
+    slot_cols = _get_slot_cols(slot, X_raw)
+    n = len(X_raw)
     valid_mask = np.zeros(n, dtype=bool)
 
     if not slot_cols or slot_predictor is None:
@@ -282,37 +370,60 @@ def _rf_slot_replacement(
     if slot_id in cf.columns:
         cf[slot_id] = np.nan
 
-    # Only process rows with at least one observed slot feature
-    observed_any = cf[slot_cols].notna().any(axis=1)
+    # Only process rows with at least one observed slot feature (from raw)
+    observed_any = X_raw[slot_cols].notna().any(axis=1)
     if not observed_any.any():
         return cf, valid_mask
 
-    pipeline, ghost, input_cols = slot_predictor
-    input_cols = [c for c in input_cols if c in df.columns]
-    X_in = df.loc[observed_any, input_cols]
+    pipeline, ghost_start, ghost_exec, input_cols = slot_predictor
+    input_cols = [c for c in input_cols if c in X_filled.columns]
+    X_in = X_filled.loc[observed_any, input_cols]
     X_processed = pipeline.named_steps["preprocess"].transform(X_in)
     if hasattr(X_processed, "toarray"):
         X_processed = X_processed.toarray()
-    samples, valid = ghost.sample(np.asarray(X_processed), B=1)
-    sample_valid = valid[0]
-    # Map valid back to full row index
-    valid_mask[observed_any] = sample_valid
+    X_processed = np.asarray(X_processed)
 
-    if sample_valid.any():
-        valid_indices = df.index[observed_any][sample_valid]
-        pred = samples[0][sample_valid]  # (n_valid_rows, n_slot_features)
-        pred_df = pd.DataFrame(pred, index=valid_indices, columns=slot_cols)
-        # Only overwrite values that were originally present (keep NaNs as NaNs)
+    obs_bool = np.asarray(observed_any)
+    is_start_obs = np.asarray(is_start_row, dtype=bool)[obs_bool]
+    start_pos = np.flatnonzero(is_start_obs)
+    exec_pos = np.flatnonzero(~is_start_obs)
+
+    all_valid_indices = []
+    all_preds = []
+
+    if len(start_pos) > 0:
+        samples_s, valid_s = ghost_start.sample(X_processed[start_pos], B=1)
+        sv = valid_s[0]
+        if sv.any():
+            obs_indices = np.flatnonzero(obs_bool)
+            all_valid_indices.append(obs_indices[start_pos][sv])
+            all_preds.append(samples_s[0][sv])
+
+    if not replace_start_only and len(exec_pos) > 0:
+        samples_e, valid_e = ghost_exec.sample(X_processed[exec_pos], B=1)
+        ev = valid_e[0]
+        if ev.any():
+            obs_indices = np.flatnonzero(obs_bool)
+            all_valid_indices.append(obs_indices[exec_pos][ev])
+            all_preds.append(samples_e[0][ev])
+
+    if all_valid_indices:
+        valid_indices = np.concatenate(all_valid_indices)
+        pred = np.vstack(all_preds)
+        valid_mask[valid_indices] = True
+        valid_labels = X_raw.index[valid_indices]
+        pred_df = pd.DataFrame(pred, index=valid_labels, columns=slot_cols)
         for col in slot_cols:
-            m = df[col].notna() & df.index.isin(valid_indices)
+            m = X_raw[col].notna() & X_raw.index.isin(valid_labels)
             if m.any():
-                cf.loc[m, col] = pred_df.loc[df.index[m], col].values
+                cf.loc[m, col] = pred_df.loc[X_raw.index[m], col].values
+
     return cf, valid_mask
 
 
 def _fill_missing_slots_with_rf(
     X: pd.DataFrame,
-    slot_predictors: dict[str, tuple[Pipeline, LeafResampleGhost, list[str]]],
+    slot_predictors: dict[str, tuple[Pipeline, LeafResampleGhost, LeafResampleGhost, list[str]]],
     exclude_slot: str | None = None,
 ) -> pd.DataFrame:
     """Fill missing slot features with conditional RF prediction (E[slot|X]). Returns a copy."""
@@ -320,7 +431,7 @@ def _fill_missing_slots_with_rf(
     for slot, pred in slot_predictors.items():
         if slot == exclude_slot:
             continue
-        pipeline, _, input_cols = pred
+        pipeline, _, _, input_cols = pred
         slot_cols = _get_slot_cols(slot, X)
         if not slot_cols:
             continue
@@ -342,69 +453,68 @@ def _credit_one_slot(
     model: Pipeline,
     source_df: pd.DataFrame,
     X_source: pd.DataFrame,
+    X_filled: pd.DataFrame,
     slot_predictors: dict,
-    base_press_value: np.ndarray,
-    base_start_by_seq: pd.Series,
+    base_proba: np.ndarray,
     start_index: pd.Series,
+    is_start_row: np.ndarray,
 ) -> pd.DataFrame:
-    """Compute credits for one slot (all ghost draws). Used by Parallel over slots."""
+    """Possession-level credits for one slot. Credit = effect on P(success)-P(failure) over whole possession.
+
+    Uses CIF (cumulative incidence) over each press. Positioning = effect of start-row slot;
+    execution = effect of non-start rows.
+    """
     slot_id = f"{slot}_id"
     pred = slot_predictors[slot]
+    base_cif = _compute_cif(base_proba, source_df["fc_sequence_id"], source_df)
+    base_val = base_cif["cif_success"].values - base_cif["cif_failure"].values
 
-    acc_total = np.zeros(len(source_df))
-    acc_start = np.zeros(len(source_df))
-    acc_exec = np.zeros(len(source_df))
-    acc_count = np.zeros(len(source_df))
+    acc_pos = np.zeros(len(base_cif))
+    acc_exec = np.zeros(len(base_cif))
+    seq_ids = base_cif["fc_sequence_id"].values
 
     for draw_idx in range(GHOST_DRAWS):
-        cf_features, valid_mask = _rf_slot_replacement(X_source, slot, pred)
-        # Fill remaining missing slots (others besides the crediting slot) with RF prediction
-        cf_features = _fill_missing_slots_with_rf(
-            cf_features, slot_predictors, exclude_slot=slot
+        cf_start_features, _ = _rf_slot_replacement(
+            X_filled, X_source, slot, pred, is_start_row, replace_start_only=True
         )
+        cf_full_features, _ = _rf_slot_replacement(
+            X_filled, X_source, slot, pred, is_start_row, replace_start_only=False
+        )
+        cf_start_proba = model.predict_proba(cf_start_features)
+        cf_full_proba = model.predict_proba(cf_full_features)
+        cf_start_cif = _compute_cif(cf_start_proba, source_df["fc_sequence_id"], source_df)
+        cf_full_cif = _compute_cif(cf_full_proba, source_df["fc_sequence_id"], source_df)
+        cf_start_val = cf_start_cif["cif_success"].values - cf_start_cif["cif_failure"].values
+        cf_full_val = cf_full_cif["cif_success"].values - cf_full_cif["cif_failure"].values
+        positioning = base_val - cf_start_val
+        execution = cf_start_val - cf_full_val
+        acc_pos += positioning
+        acc_exec += execution
 
-        cf_press_value = base_press_value.copy()
-        if np.any(valid_mask):
-            cf_proba = model.predict_proba(cf_features.loc[valid_mask])
-            cf_press_value[valid_mask] = cf_proba[:, 1] - cf_proba[:, 2]
+    denom = GHOST_DRAWS
+    positioning = acc_pos / denom
+    execution = acc_exec / denom
+    total = positioning + execution
 
-        cf_start_by_seq = pd.Series(cf_press_value, index=source_df.index).loc[start_index.values]
-        cf_start_by_seq.index = start_index.index
+    # Map back to (player, fc_sequence_id): use start row's player for each sequence
+    player_per_seq = np.empty(len(seq_ids), dtype=object)
+    player_per_seq[:] = None
+    for i, sid in enumerate(seq_ids):
+        if sid in start_index.index and slot_id in source_df.columns:
+            row_idx = start_index.loc[sid]
+            if hasattr(row_idx, "__iter__") and not isinstance(row_idx, str):
+                row_idx = row_idx[0] if len(row_idx) else None
+            if row_idx is not None and row_idx in source_df.index:
+                player_per_seq[i] = source_df.loc[row_idx, slot_id]
 
-        total_credit = base_press_value - cf_press_value
-        base_start_aligned = source_df["fc_sequence_id"].map(base_start_by_seq).to_numpy(dtype=float)
-        cf_start_aligned = source_df["fc_sequence_id"].map(cf_start_by_seq).to_numpy(dtype=float)
-        start_positioning_credit = base_start_aligned - cf_start_aligned
-        execution_credit = total_credit - start_positioning_credit
-
-        acc_total += total_credit
-        acc_start += start_positioning_credit
-        acc_exec += execution_credit
-        acc_count += valid_mask
-
-    denom = np.maximum(acc_count, 1)
-    total_credit = acc_total / denom
-    start_positioning_credit = acc_start / denom
-    execution_credit = acc_exec / denom
-
-    # Fully-missing frames: no evidence, avoid artificial execution penalty (-start)
-    slot_cols = _get_slot_cols(slot, X_source)
-    if slot_cols:
-        fully_missing = X_source[slot_cols].isna().all(axis=1).to_numpy()
-        execution_credit[fully_missing] = np.nan
-        total_credit[fully_missing] = np.nan
-
-    slot_frame = pd.DataFrame(
-        {
-            "player_id": source_df[slot_id].values,
-            "fc_sequence_id": source_df["fc_sequence_id"].values,
-            "sl_event_id": source_df["sl_event_id"].values,
-            "slot": slot,
-            "start_positioning_credit": start_positioning_credit,
-            "execution_credit": execution_credit,
-            "total_press_credit": total_credit,
-        }
-    )
+    slot_frame = pd.DataFrame({
+        "player_id": player_per_seq,
+        "fc_sequence_id": seq_ids,
+        "slot": slot,
+        "start_positioning_credit": positioning,
+        "execution_credit": execution,
+        "total_press_credit": total,
+    })
     return slot_frame.dropna(subset=["player_id"])
 
 
@@ -412,7 +522,7 @@ def build_player_press_credit(
     model: Pipeline,
     source_df: pd.DataFrame,
     X_source: pd.DataFrame,
-    slot_predictors: dict[str, tuple[Pipeline, LeafResampleGhost, list[str]]] | None = None,
+    slot_predictors: dict[str, tuple[Pipeline, LeafResampleGhost, LeafResampleGhost, list[str]]] | None = None,
 ) -> pd.DataFrame:
     """Estimate player-level press value and split into start-state vs execution credit.
 
@@ -421,47 +531,21 @@ def build_player_press_credit(
     - execution_credit: remaining effect beyond sequence start
     - total_press_credit: start_positioning_credit + execution_credit
     """
-    # Fill missing slot features with conditional RF prediction before scoring
     if slot_predictors:
-        X_for_base = _fill_missing_slots_with_rf(X_source, slot_predictors)
+        X_filled = _fill_missing_slots_with_rf(X_source, slot_predictors)
     else:
-        X_for_base = X_source
+        X_filled = X_source
 
-    base_proba = model.predict_proba(X_for_base)
-    base_press_value = base_proba[:, 1] - base_proba[:, 2]  # P(success) - P(failure)
+    base_proba = model.predict_proba(X_filled)
+    start_index, is_start_row = _compute_start_meta(source_df)
 
-    # Identify sequence-start row per fc_sequence_id (earliest elapsed time; tie-break by event id)
-    ordering = pd.DataFrame(
-        {
-            "fc_sequence_id": source_df["fc_sequence_id"].values,
-            "time_since_start_s": X_source["time_since_start_s"].astype(float).values,
-            "sl_event_id": source_df["sl_event_id"].values,
-        },
-        index=source_df.index,
-    )
-    start_rows = (
-        ordering.sort_values(["fc_sequence_id", "time_since_start_s", "sl_event_id"])
-        .groupby("fc_sequence_id", as_index=False)
-        .first()[["fc_sequence_id", "time_since_start_s", "sl_event_id"]]
-    )
-    start_index = (
-        ordering.reset_index()
-        .merge(start_rows, on=["fc_sequence_id", "time_since_start_s", "sl_event_id"], how="inner")
-        .drop_duplicates(subset=["fc_sequence_id"])
-        .set_index("fc_sequence_id")["index"]
-    )
-
-    base_start_by_seq = pd.Series(base_press_value, index=source_df.index).loc[start_index.values]
-    base_start_by_seq.index = start_index.index
-
-    # For each forechecker slot F1..F5, compute leave-one-out credit in parallel
     slot_tasks = [
         (rank, slot)
         for rank, slot in enumerate(FORECHECK_SLOTS)
         if f"{slot}_id" in source_df.columns
         and slot_predictors.get(slot) is not None
     ]
-    tqdm.write(f"  Crediting {len(slot_tasks)} slots in parallel (n_jobs={N_JOBS})...")
+    tqdm.write(f"  Crediting {len(slot_tasks)} slots in parallel (possession-level CIF)...")
     credit_rows = Parallel(n_jobs=N_JOBS, backend="loky")(
         delayed(_credit_one_slot)(
             slot_rank=rank,
@@ -469,10 +553,11 @@ def build_player_press_credit(
             model=model,
             source_df=source_df,
             X_source=X_source,
+            X_filled=X_filled,
             slot_predictors=slot_predictors,
-            base_press_value=base_press_value,
-            base_start_by_seq=base_start_by_seq,
+            base_proba=base_proba,
             start_index=start_index,
+            is_start_row=is_start_row,
         )
         for rank, slot in slot_tasks
     )
@@ -482,26 +567,42 @@ def build_player_press_credit(
             columns=["player_id", "n_rows", "n_press", "positioning", "execution", "total", "total_per_press"]
         )
 
-    per_row = pd.concat(credit_rows, ignore_index=True)
+    per_slot = pd.concat(credit_rows, ignore_index=True)
 
     # Cap extreme counterfactual deltas (can occur when model extrapolates)
     for col in ["start_positioning_credit", "execution_credit", "total_press_credit"]:
-        per_row[col] = per_row[col].clip(lower=-1.0, upper=1.0)
+        per_slot[col] = per_slot[col].clip(lower=-1.0, upper=1.0)
 
-    # Per (player, press): positioning = start value (once per press); execution = mean over frames
+    # Sum across slots when player in multiple slots same press
     per_press = (
-        per_row.groupby(["player_id", "fc_sequence_id"], as_index=False)
+        per_slot.groupby(["player_id", "fc_sequence_id"], as_index=False)
         .agg(
-            positioning=("start_positioning_credit", "first"),  # same for all rows in press
-            execution=("execution_credit", "mean"),  # avg gain/loss over frames player is in
+            positioning=("start_positioning_credit", "sum"),
+            execution=("execution_credit", "sum"),
+            total_in_press=("total_press_credit", "sum"),
         )
     )
-    # execution=nan for fully-missing frames (no evidence); treat as 0 in total
-    per_press["execution"] = per_press["execution"].fillna(0.0)
-    per_press["total_in_press"] = per_press["positioning"] + per_press["execution"]
 
-    # Sum across presses for player totals
-    n_rows = per_row.groupby("player_id").size().reset_index(name="n_rows")
+    # Diagnostic: exec bias (possession-level)
+    exec_valid = per_press["execution"].dropna()
+    if len(exec_valid) > 0:
+        tqdm.write(
+            f"  Exec bias (possession): mean={exec_valid.mean():.4f}, median={exec_valid.median():.4f}, "
+            f"pct_positive={100 * (exec_valid > 0).mean():.1f}%, n={len(exec_valid):,}"
+        )
+
+    # Player totals; n_rows = frames player participated in (for exec rate denominator)
+    slot_cols = [f"{s}_id" for s in FORECHECK_SLOTS if f"{s}_id" in source_df.columns]
+    melted = source_df[["fc_sequence_id"] + slot_cols].melt(
+        id_vars=["fc_sequence_id"], value_vars=slot_cols, var_name="_", value_name="player_id"
+    ).dropna(subset=["player_id"])
+    rows_per_seq = source_df.groupby("fc_sequence_id").size().reset_index(name="n")
+    n_rows = (
+        melted.merge(rows_per_seq, on="fc_sequence_id")
+        .groupby("player_id")["n"]
+        .sum()
+        .reset_index(name="n_rows")
+    )
     summary = (
         per_press.groupby("player_id", as_index=False)
         .agg(
@@ -512,8 +613,12 @@ def build_player_press_credit(
         )
     )
     summary = summary.merge(n_rows, on="player_id", how="left")
-    summary["total_per_press"] = np.where(summary["n_press"] > 0, summary["total"] / summary["n_press"], np.nan)
-    summary = summary.sort_values("total", ascending=False).reset_index(drop=True)
+    summary["execution"] = summary["execution"].fillna(0)
+    summary["check_total"] = summary["positioning"] + summary["execution"]
+    summary["check_per_press"] = np.where(
+        summary["n_press"] > 0, summary["check_total"] / summary["n_press"], np.nan
+    )
+    summary = summary.sort_values("check_per_press", ascending=False).reset_index(drop=True)
 
     return summary
 
@@ -527,12 +632,11 @@ def _write_clean_csv(credit: pd.DataFrame, out_path: Path) -> None:
     merge_cols = {pid_col: "player_id", name_col: "player_name"}
     if pos_col in players_df.columns:
         merge_cols[pos_col] = "position"
-    out = credit[["player_id", "n_rows", "n_press", "positioning", "execution", "total", "total_per_press"]].copy()
+    keep = ["player_id", "n_rows", "n_press", "positioning", "execution", "check_total", "check_per_press"]
+    out = credit[[c for c in keep if c in credit.columns]].copy()
     out = out.rename(columns={
-        "positioning": "total_positioning",
-        "execution": "total_execution",
-        "total": "total_check",
-        "total_per_press": "check_per_press",
+        "positioning": "pos_total",
+        "execution": "exec_total",
     })
     out = out.sort_values("check_per_press", ascending=False).reset_index(drop=True)
     out = out.merge(
@@ -540,15 +644,37 @@ def _write_clean_csv(credit: pd.DataFrame, out_path: Path) -> None:
         on="player_id",
         how="left",
     )
-    out_cols = ["player_id", "player_name", "position", "n_press", "n_rows", "total_positioning", "total_execution", "total_check", "check_per_press"]
+    out_cols = [
+        "player_id", "player_name", "position", "n_press", "n_rows",
+        "pos_total", "exec_total", "check_total", "check_per_press",
+    ]
     out = out[[c for c in out_cols if c in out.columns]]
     out.to_csv(out_path, index=False)
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description="Train hazard models and compute player credits")
+    parser.add_argument(
+        "--max-rows",
+        type=int,
+        default=None,
+        help="Subsample to ~N rows (by sequence) for smaller eval. E.g. 5000 for previous setup.",
+    )
+    args = parser.parse_args()
+
     # ---- Data loading and splitting ----
     print("[1/5] Loading data and splitting...")
     df = load_data()
+
+    if args.max_rows is not None:
+        seq_ids = df["fc_sequence_id"].unique()
+        rng = np.random.default_rng(RANDOM_STATE)
+        mean_per_seq = len(df) / len(seq_ids)
+        n_seq = max(1, min(len(seq_ids), int(args.max_rows / mean_per_seq)))
+        keep_seq = rng.choice(seq_ids, size=n_seq, replace=False)
+        df = df[df["fc_sequence_id"].isin(keep_seq)].copy()
+        print(f"  Subsampled to {len(df):,} rows ({n_seq} sequences)")
+
     add_slot_imputed_indicators(df)
     train_df, test_df = split_groups(df)
     print(f"  Train: {len(train_df):,} rows, Test: {len(test_df):,} rows")
@@ -623,8 +749,9 @@ def main() -> None:
     print(f"  Best: {summary.iloc[0]['model']} (log_loss={summary.iloc[0]['log_loss']:.4f})")
 
     # ---- Fit per-slot RF predictors for counterfactual replacement ----
-    print("\n[3/5] Fitting slot predictors (RF per slot)...")
-    slot_predictors = fit_slot_predictors(X_train, numeric_cols, cat_cols)
+    print("\n[3/5] Fitting slot predictors (RF per slot, start vs exec ghosts)...")
+    _, train_is_start = _compute_start_meta(train_df)
+    slot_predictors = fit_slot_predictors(X_train, numeric_cols, cat_cols, train_is_start)
     print(f"  Fitted: {list(slot_predictors.keys())}")
     print(f"  Averaging credits over {GHOST_DRAWS} ghost draws per row")
 
