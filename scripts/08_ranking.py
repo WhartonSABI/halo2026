@@ -36,11 +36,14 @@ def main() -> None:
         dfs.append(("distance", d[cols].rename(columns={"total": "total_distance"})))
     if (RESULTS / "modeling.csv").exists():
         m = pd.read_csv(RESULTS / "modeling.csv")
-        m["rank_model"] = m["total_check"].rank(ascending=False, method="min")
-        cols = ["player_id", "n_rows", "total_check", "rank_model"]
+        total_col = "check_total" if "check_total" in m.columns else "total_check"
+        m["rank_model"] = m[total_col].rank(ascending=False, method="min")
+        cols = ["player_id", total_col, "rank_model"]
         if "n_press" in m.columns:
             cols.insert(1, "n_press")
-        dfs.append(("modeling", m[cols].rename(columns={"total_check": "total_modeling"})))
+        if "n_rows" in m.columns:
+            cols.insert(2, "n_rows")
+        dfs.append(("modeling", m[cols].rename(columns={total_col: "total_modeling"})))
 
     if not dfs:
         print("No result CSVs found. Run 04_simple-attribution and 07_modeling first.")

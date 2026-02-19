@@ -43,7 +43,7 @@ from sklearn.model_selection import GroupShuffleSplit
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder
 from sklearn.linear_model import LogisticRegression
-from sklearn.ensemble import HistGradientBoostingClassifier, RandomForestRegressor
+from sklearn.ensemble import GradientBoostingClassifier, HistGradientBoostingClassifier, RandomForestRegressor
 import xgboost as xgb
 
 import importlib.util
@@ -90,7 +90,7 @@ def load_tuned_params() -> dict[str, dict]:
     """Load best hyperparameters from tuning_results.csv (from 06_tuning.py).
 
     Returns dict mapping model name to param dict (without model__ prefix).
-    Model names: hist_gbm, xgboost. Falls back to empty dict if file missing.
+    Model names: hist_gbm, gbm, xgboost. Falls back to empty dict if file missing.
     """
     path = RESULTS_DIR / "tuning_results.csv"
     if not path.exists():
@@ -108,6 +108,63 @@ def load_tuned_params() -> dict[str, dict]:
         params = {k.replace("model__", ""): v for k, v in raw.items()}
         out[name] = params
     return out
+
+
+def load_best_model_from_tuning() -> tuple[str, dict] | None:
+    """Load best model name and params from tuning_results.csv (sorted by test_log_loss).
+
+    Returns (model_name, params) or None if tuning_results missing/empty.
+    Model names: hist_gbm, gbm, xgboost.
+    """
+    path = RESULTS_DIR / "tuning_results.csv"
+    if not path.exists():
+        return None
+    df = pd.read_csv(path)
+    if df.empty or "model" not in df.columns:
+        return None
+    df = df.sort_values("test_log_loss").reset_index(drop=True)
+    row = df.iloc[0]
+    name = str(row["model"])
+    try:
+        raw = ast.literal_eval(str(row["best_params"]))
+    except (ValueError, SyntaxError):
+        return None
+    params = {k.replace("model__", ""): v for k, v in raw.items()}
+    return (name, params)
+
+
+def _build_model(name: str, params: dict, preprocessor: ColumnTransformer) -> Pipeline:
+    """Build a single hazard model pipeline. name: hist_gbm, gbm, or xgboost."""
+    hist_keys = {"max_depth", "learning_rate", "max_iter", "min_samples_leaf", "l2_regularization", "max_bins"}
+    gbm_keys = {"max_depth", "learning_rate", "n_estimators", "min_samples_leaf", "subsample", "max_features"}
+    xgb_keys = {"max_depth", "learning_rate", "n_estimators", "min_child_weight", "subsample", "colsample_bytree", "reg_alpha", "reg_lambda"}
+
+    if name == "hist_gbm":
+        estimator = HistGradientBoostingClassifier(
+            random_state=RANDOM_STATE,
+            **{k: v for k, v in params.items() if k in hist_keys},
+        )
+    elif name == "gbm":
+        estimator = GradientBoostingClassifier(
+            random_state=RANDOM_STATE,
+            **{k: v for k, v in params.items() if k in gbm_keys},
+        )
+    elif name == "xgboost":
+        estimator = xgb.XGBClassifier(
+            objective="multi:softprob",
+            num_class=3,
+            random_state=RANDOM_STATE,
+            n_jobs=-1,
+            **{k: v for k, v in params.items() if k in xgb_keys},
+        )
+    else:
+        raise ValueError(f"Unknown model: {name}")
+
+    return Pipeline([
+        ("time_aug", TimeAugmenter()),
+        ("prep", preprocessor),
+        ("model", estimator),
+    ])
 
 
 def evaluate_model(name: str, model: Pipeline, X_test: pd.DataFrame, y_test: pd.Series) -> dict[str, float]:
@@ -447,6 +504,67 @@ def _fill_missing_slots_with_rf(
     return out
 
 
+def _get_stints_per_sequence(
+    source_df: pd.DataFrame,
+    slot_id: str,
+    start_index: pd.Series,
+    seq_ids: np.ndarray,
+) -> dict:
+    """Get stint allocations per sequence for a slot.
+
+    Stints = consecutive rows (within sequence, sorted by time) with same non-NaN slot_id.
+    Returns dict: seq_id -> list of (player_id, n_non_start_rows, contains_start_row).
+    """
+    if slot_id not in source_df.columns:
+        return {int(sid) if isinstance(sid, (np.integer, np.int64)) else sid: [] for sid in seq_ids}
+
+    out = {}
+    for seq_id, grp in source_df.groupby("fc_sequence_id", sort=False):
+        if seq_id not in seq_ids:
+            continue
+        grp = grp.sort_values(["time_since_start_s", "sl_event_id"])
+        start_idx = start_index.loc[seq_id] if seq_id in start_index.index else None
+        if hasattr(start_idx, "__iter__") and not isinstance(start_idx, str):
+            start_idx = start_idx[0] if len(start_idx) else None
+
+        stints = []
+        current_player = None
+        current_n_non_start = 0
+        current_contains_start = False
+
+        for idx, row in grp.iterrows():
+            player = row[slot_id]
+            is_start = (idx == start_idx) if start_idx is not None else False
+
+            if pd.isna(player):
+                if current_player is not None:
+                    stints.append((current_player, current_n_non_start, current_contains_start))
+                    current_player = None
+                    current_n_non_start = 0
+                    current_contains_start = False
+                continue
+
+            if player == current_player:
+                current_n_non_start += 0 if is_start else 1
+                current_contains_start = current_contains_start or is_start
+            else:
+                if current_player is not None:
+                    stints.append((current_player, current_n_non_start, current_contains_start))
+                current_player = player
+                current_n_non_start = 0 if is_start else 1
+                current_contains_start = is_start
+
+        if current_player is not None:
+            stints.append((current_player, current_n_non_start, current_contains_start))
+
+        out[seq_id] = stints
+
+    for sid in seq_ids:
+        if sid not in out:
+            out[sid] = []
+    return out
+
+
 def _credit_one_slot(
     slot_rank: int,
     slot: str,
@@ -494,28 +612,33 @@ def _credit_one_slot(
     denom = GHOST_DRAWS
     positioning = acc_pos / denom
     execution = acc_exec / denom
-    total = positioning + execution
 
-    # Map back to (player, fc_sequence_id): use start row's player for each sequence
-    player_per_seq = np.empty(len(seq_ids), dtype=object)
-    player_per_seq[:] = None
+    # Attribute by stint: positioning to start-stint player, execution split by non-start row share
+    stints_by_seq = _get_stints_per_sequence(source_df, slot_id, start_index, seq_ids)
+    rows = []
     for i, sid in enumerate(seq_ids):
-        if sid in start_index.index and slot_id in source_df.columns:
-            row_idx = start_index.loc[sid]
-            if hasattr(row_idx, "__iter__") and not isinstance(row_idx, str):
-                row_idx = row_idx[0] if len(row_idx) else None
-            if row_idx is not None and row_idx in source_df.index:
-                player_per_seq[i] = source_df.loc[row_idx, slot_id]
-
-    slot_frame = pd.DataFrame({
-        "player_id": player_per_seq,
-        "fc_sequence_id": seq_ids,
-        "slot": slot,
-        "start_positioning_credit": positioning,
-        "execution_credit": execution,
-        "total_press_credit": total,
-    })
-    return slot_frame.dropna(subset=["player_id"])
+        stints = stints_by_seq.get(sid, [])
+        total_non_start = sum(s[1] for s in stints)
+        pos_i = positioning[i]
+        exec_i = execution[i]
+        for player_id, n_non_start, contains_start in stints:
+            pos_credit = pos_i if contains_start else 0.0
+            exec_share = n_non_start / total_non_start if total_non_start > 0 else 0.0
+            exec_credit = exec_i * exec_share
+            total = pos_credit + exec_credit
+            if player_id is not None and (pos_credit != 0 or exec_credit != 0):
+                rows.append({
+                    "player_id": player_id,
+                    "fc_sequence_id": sid,
+                    "slot": slot,
+                    "start_positioning_credit": pos_credit,
+                    "execution_credit": exec_credit,
+                    "total_press_credit": total,
+                })
+    slot_frame = pd.DataFrame(rows)
+    return slot_frame.dropna(subset=["player_id"]) if len(rows) > 0 else pd.DataFrame(
+        columns=["player_id", "fc_sequence_id", "slot", "start_positioning_credit", "execution_credit", "total_press_credit"]
+    )
 
 
 def build_player_press_credit(
@@ -523,6 +646,7 @@ def build_player_press_credit(
     source_df: pd.DataFrame,
     X_source: pd.DataFrame,
     slot_predictors: dict[str, tuple[Pipeline, LeafResampleGhost, LeafResampleGhost, list[str]]] | None = None,
+    save_per_press_path: Path | None = None,
 ) -> pd.DataFrame:
     """Estimate player-level press value and split into start-state vs execution credit.
 
@@ -582,27 +706,53 @@ def build_player_press_credit(
             total_in_press=("total_press_credit", "sum"),
         )
     )
+    if save_per_press_path is not None:
+        per_press.to_parquet(save_per_press_path, index=False)
+        tqdm.write(f"  Saved player_press to {save_per_press_path}")
 
-    # Diagnostic: exec bias (possession-level)
-    exec_valid = per_press["execution"].dropna()
-    if len(exec_valid) > 0:
-        tqdm.write(
-            f"  Exec bias (possession): mean={exec_valid.mean():.4f}, median={exec_valid.median():.4f}, "
-            f"pct_positive={100 * (exec_valid > 0).mean():.1f}%, n={len(exec_valid):,}"
-        )
+    # Diagnostic: possession-level distribution
+    if len(per_press) > 0:
+        n_press_per_player = per_press.groupby("player_id").size()
+        per_press_with_n = per_press.copy()
+        per_press_with_n["player_n_press"] = per_press_with_n["player_id"].map(n_press_per_player)
+        for col, name in [
+            ("positioning", "pos"),
+            ("execution", "exec"),
+            ("total_in_press", "total"),
+        ]:
+            s = per_press[col].dropna()
+            if len(s) > 0:
+                tqdm.write(
+                    f"  {name} (possession): mean={s.mean():.4f}, median={s.median():.4f}, "
+                    f"pct_pos={100 * (s > 0).mean():.1f}%, n={len(s):,}"
+                )
+        high = per_press_with_n["player_n_press"] > 10
+        low = per_press_with_n["player_n_press"] <= 10
+        if high.sum() > 0:
+            sh = per_press_with_n.loc[high, "execution"]
+            tqdm.write(
+                f"  exec from high-n (n_press>10): n={high.sum():,}, pct_pos={100*(sh>0).mean():.1f}%"
+            )
+        if low.sum() > 0:
+            sl = per_press_with_n.loc[low, "execution"]
+            tqdm.write(
+                f"  exec from low-n (n_press<=10): n={low.sum():,}, pct_pos={100*(sl>0).mean():.1f}%"
+            )
+        ex = per_press["execution"]
+        pos_vals = ex[ex > 0]
+        neg_vals = ex[ex < 0]
+        if len(pos_vals) > 0 and len(neg_vals) > 0:
+            tqdm.write(
+                f"  exec magnitude: mean(pos)={pos_vals.mean():.4f}, mean(neg)={neg_vals.mean():.4f}"
+            )
 
-    # Player totals; n_rows = frames player participated in (for exec rate denominator)
+    # Player totals; n_rows = frames player participated in (unique rows where player in any slot)
     slot_cols = [f"{s}_id" for s in FORECHECK_SLOTS if f"{s}_id" in source_df.columns]
-    melted = source_df[["fc_sequence_id"] + slot_cols].melt(
-        id_vars=["fc_sequence_id"], value_vars=slot_cols, var_name="_", value_name="player_id"
+    with_idx = source_df[["fc_sequence_id"] + slot_cols].reset_index()
+    melted = with_idx.melt(
+        id_vars=["index", "fc_sequence_id"], value_vars=slot_cols, var_name="_", value_name="player_id"
     ).dropna(subset=["player_id"])
-    rows_per_seq = source_df.groupby("fc_sequence_id").size().reset_index(name="n")
-    n_rows = (
-        melted.merge(rows_per_seq, on="fc_sequence_id")
-        .groupby("player_id")["n"]
-        .sum()
-        .reset_index(name="n_rows")
-    )
+    n_rows = melted.groupby("player_id")["index"].nunique().reset_index(name="n_rows")
     summary = (
         per_press.groupby("player_id", as_index=False)
         .agg(
@@ -688,65 +838,68 @@ def main() -> None:
 
     preprocessor = build_preprocessor(numeric_cols, cat_cols)
 
-    # ---- Train competing models ----
-    print("\n[2/5] Training hazard models...")
-    tuned = load_tuned_params()
-    if tuned:
-        print("Loaded tuned params from tuning_results.csv")
-    hist_defaults = {"max_depth": 8, "learning_rate": 0.05, "max_iter": 300}
-    xgb_defaults = {
-        "max_depth": 8,
-        "learning_rate": 0.05,
-        "n_estimators": 800,
-        "min_child_weight": 5,
-        "subsample": 0.8,
-        "colsample_bytree": 1.0,
-        "reg_alpha": 1.0,
-        "reg_lambda": 1.0,
-    }
-
-    hist_params = {**hist_defaults, **(tuned.get("hist_gbm") or {})}
-    xgb_params = {**xgb_defaults, **(tuned.get("xgboost") or {})}
-
-    models = {
-        "multinomial_logit": LogisticRegression(
-            max_iter=1000,
-            class_weight="balanced",
-            random_state=RANDOM_STATE,
-        ),
-        "gbm_hist": HistGradientBoostingClassifier(
-            random_state=RANDOM_STATE,
-            **{k: v for k, v in hist_params.items() if k in {"max_depth", "learning_rate", "max_iter", "min_samples_leaf", "l2_regularization", "max_bins"}},
-        ),
-        "xgboost": xgb.XGBClassifier(
-            objective="multi:softprob",
-            num_class=3,
-            random_state=RANDOM_STATE,
-            n_jobs=-1,
-            **{k: v for k, v in xgb_params.items() if k in {"max_depth", "learning_rate", "n_estimators", "min_child_weight", "subsample", "colsample_bytree", "reg_alpha", "reg_lambda"}},
-        ),
-    }
-
-    rows = []
+    # ---- Train hazard model ----
+    # Use tuning winner when available; else train all three and pick best.
+    best_model_name: str
     fitted_models: dict[str, Pipeline] = {}
-    for name, estimator in tqdm(models.items(), desc="  Models", unit="model", file=sys.stdout):
-        pipe = Pipeline(
-            steps=[
+    summary: pd.DataFrame
+
+    tuning_choice = load_best_model_from_tuning()
+    if tuning_choice is not None:
+        best_model_name, best_params = tuning_choice
+        print(f"\n[2/5] Training {best_model_name} (from tuning_results.csv)...")
+        pipe = _build_model(best_model_name, best_params, preprocessor)
+        pipe.fit(X_train, y_train)
+        fitted_models[best_model_name] = pipe
+        proba = pipe.predict_proba(X_test)
+        ll = log_loss(y_test, proba, labels=[0, 1, 2])
+        summary = pd.DataFrame([{
+            "model": best_model_name,
+            "log_loss": ll,
+            "mean_success_hazard": float(proba[:, 1].mean()),
+            "mean_failure_hazard": float(proba[:, 2].mean()),
+        }])
+    else:
+        print("\n[2/5] Training hazard models (no tuning_results.csv; comparing all)...")
+        tuned = load_tuned_params()
+        hist_defaults = {"max_depth": 8, "learning_rate": 0.05, "max_iter": 300}
+        xgb_defaults = {
+            "max_depth": 8, "learning_rate": 0.05, "n_estimators": 800,
+            "min_child_weight": 5, "subsample": 0.8, "colsample_bytree": 1.0,
+            "reg_alpha": 1.0, "reg_lambda": 1.0,
+        }
+        hist_params = {**hist_defaults, **(tuned.get("hist_gbm") or {})}
+        xgb_params = {**xgb_defaults, **(tuned.get("xgboost") or {})}
+
+        models = {
+            "multinomial_logit": LogisticRegression(max_iter=1000, class_weight="balanced", random_state=RANDOM_STATE),
+            "gbm_hist": HistGradientBoostingClassifier(
+                random_state=RANDOM_STATE,
+                **{k: v for k, v in hist_params.items() if k in {"max_depth", "learning_rate", "max_iter", "min_samples_leaf", "l2_regularization", "max_bins"}},
+            ),
+            "xgboost": xgb.XGBClassifier(
+                objective="multi:softprob", num_class=3, random_state=RANDOM_STATE, n_jobs=-1,
+                **{k: v for k, v in xgb_params.items() if k in {"max_depth", "learning_rate", "n_estimators", "min_child_weight", "subsample", "colsample_bytree", "reg_alpha", "reg_lambda"}},
+            ),
+        }
+        rows = []
+        for name, estimator in tqdm(models.items(), desc="  Models", unit="model", file=sys.stdout):
+            pipe = Pipeline([
                 ("time_aug", TimeAugmenter()),
                 ("prep", preprocessor),
                 ("model", estimator),
-            ]
-        )
-        pipe.fit(X_train, y_train)
-        fitted_models[name] = pipe
-        rows.append(evaluate_model(name, pipe, X_test, y_test))
+            ])
+            pipe.fit(X_train, y_train)
+            fitted_models[name] = pipe
+            rows.append(evaluate_model(name, pipe, X_test, y_test))
+        summary = pd.DataFrame(rows).sort_values("log_loss")
+        best_model_name = summary.iloc[0]["model"]
 
-    summary = pd.DataFrame(rows).sort_values("log_loss")
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     out_path = RESULTS_DIR / "model_summary.csv"
     summary.to_csv(out_path, index=False)
-    print(f"  Best: {summary.iloc[0]['model']} (log_loss={summary.iloc[0]['log_loss']:.4f})")
+    print(f"  Model: {best_model_name} (log_loss={summary.iloc[0]['log_loss']:.4f})")
 
     # ---- Fit per-slot RF predictors for counterfactual replacement ----
     print("\n[3/5] Fitting slot predictors (RF per slot, start vs exec ghosts)...")
@@ -755,11 +908,27 @@ def main() -> None:
     print(f"  Fitted: {list(slot_predictors.keys())}")
     print(f"  Averaging credits over {GHOST_DRAWS} ghost draws per row")
 
-    # ---- Player attribution from best model ----
-    print("\n[4/5] Computing player credits...")
+    # ---- Slot-change audit (stint attribution relevance) ----
+    slot_ids = [f"{s}_id" for s in FORECHECK_SLOTS if f"{s}_id" in df.columns]
+    if slot_ids:
+        frac_changing = (
+            df.groupby("fc_sequence_id")[slot_ids]
+            .nunique(dropna=False)
+            .gt(1)
+            .any(axis=1)
+            .mean()
+        )
+        print(f"  Audit: fraction of sequences with slot changes (any slot): {frac_changing:.4f}")
+
+    # ---- Player attribution from best model (on full data, like participation/distance) ----
+    print("\n[4/5] Computing player credits on full data...")
     best_model_name = summary.iloc[0]["model"]
     best_model = fitted_models[best_model_name]
-    player_credit = build_player_press_credit(best_model, test_df, X_test, slot_predictors)
+    X_all = df[numeric_cols + cat_cols]
+    player_credit = build_player_press_credit(
+        best_model, df, X_all, slot_predictors,
+        save_per_press_path=RESULTS_DIR / "player_press.parquet",
+    )
     model_out = RESULTS_DIR / "modeling.csv"
     _write_clean_csv(player_credit, model_out)
 

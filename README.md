@@ -28,7 +28,7 @@ python scripts/07_modeling.py
 python scripts/08_ranking.py
 ```
 
-Outputs: `data/results/ranking.csv` (composite player ranks), `participation.csv`, `distance.csv`, `modeling.csv`.
+Outputs: `data/results/ranking.csv` (composite player ranks), `participation.csv`, `distance.csv`, `modeling.csv`, `player_press.parquet`.
 
 ---
 
@@ -58,8 +58,8 @@ Sequences are built by `01_forechecks.py`: each starts with a dump-in and the de
 | 4 | `04_simple-attribution.py` | forechecks, hazard features, raw | `terminal_recovery_value.parquet`, `participation.csv`, `distance.csv` |
 | 5 | `05_preprocess.py` | *(library used by tuning & modeling)* | — |
 | 6 | `06_tuning.py` | `hazard_features.parquet` | `tuning_results.csv` *(GBM/XGBoost tuning, optional)* |
-| 7 | `07_modeling.py` | `hazard_features.parquet` | `modeling.csv`, `model_summary.csv` |
-| 8 | `08_ranking.py` | participation, distance, modeling CSVs | `ranking.csv` (composite rank) |
+| 7 | `07_modeling.py` | `hazard_features.parquet` | `modeling.csv`, `model_summary.csv`, `player_press.parquet` |
+| 8 | `08_ranking.py` | participation, distance, modeling | `ranking.csv` (composite rank) |
 
 Paths are relative to `scripts/` and `data/` (`raw/`, `processed/`, `results/`). See `data_dictionary.md` for raw schema.
 
@@ -99,7 +99,7 @@ python scripts/06_tuning.py --quick  # quick: 10 iterations per model
 ├── data/
 │   ├── raw/                     # events, games, players, stints, tracking
 │   ├── processed/               # forechecks, hazard_features, terminal_recovery_value
-│   └── results/                 # participation, distance, modeling, ranking
+│   └── results/                 # participation, distance, modeling, player_press, ranking
 └── plots/                       # EDA outputs
 ```
 
