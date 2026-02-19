@@ -1,0 +1,5 @@
+model,cv_log_loss,test_log_loss,best_params
+p0_xgb,0.5406411672012333,0.5418597012936003,"{'subsample': 0.8, 'reg_lambda': 0.1, 'reg_alpha': 0.0, 'n_estimators': 500, 'min_child_weight': 5, 'max_depth': 8, 'learning_rate': 0.01, 'colsample_bytree': 0.7}"
+xgboost,0.11559095191533672,0.11618209603382128,"{'subsample': 0.8, 'reg_lambda': 1.0, 'reg_alpha': 1.0, 'n_estimators': 800, 'min_child_weight': 5, 'max_depth': 8, 'learning_rate': 0.05, 'colsample_bytree': 1.0}"
+hist_gbm,0.12063127712415449,0.12322689290078008,"{'min_samples_leaf': 20, 'max_iter': 500, 'max_depth': 8, 'max_bins': 255, 'learning_rate': 0.03, 'l2_regularization': 0.0}"
+rf,0.13748289349761733,0.13841643344828164,"{'n_estimators': 300, 'min_samples_leaf': 10, 'max_features': None, 'max_depth': 10}"

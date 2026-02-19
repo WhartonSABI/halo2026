@@ -1,2 +1,2 @@
-model,log_loss,mean_success_hazard,mean_failure_hazard
-xgboost,0.11618209603382128,0.0677986592054367,0.12387493252754211
+model,start_model,hazard_model,hazard_log_loss
+hybrid,p0_xgb,xgboost,0.13112799183420923

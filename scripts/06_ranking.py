@@ -2,9 +2,9 @@
 """Combined forecheck ranking from participation, distance, and modeling outputs.
 
 Merges results from:
-- participation.csv (04_simple-attribution, equal split)
-- distance.csv (04_simple-attribution, distance-weighted)
-- modeling.csv (07_modeling, hazard-model counterfactual credits)
+- participation.csv (03_simple-attribution, equal split)
+- distance.csv (03_simple-attribution, distance-weighted)
+- modeling.csv (05_modeling, hazard-model counterfactual credits)
 
 Output: ranking.csv with composite_rank = mean of individual method ranks.
 """
@@ -18,7 +18,6 @@ RESULTS = PROJECT / "data" / "results"
 
 
 def main() -> None:
-    # ---- Load available result files ----
     dfs = []
     if (RESULTS / "participation.csv").exists():
         p = pd.read_csv(RESULTS / "participation.csv")
@@ -50,15 +49,13 @@ def main() -> None:
         dfs.append(("modeling", m[cols].rename(columns={total_col: "total_modeling"})))
 
     if not dfs:
-        print("No result CSVs found. Run 04_simple-attribution and 07_modeling first.")
+        print("No result CSVs found. Run 03_simple-attribution and 05_modeling first.")
         return
 
-    # ---- Outer merge on player_id; each method contributes its rank and total ----
     merged = dfs[0][1]
     for _, df in dfs[1:]:
         merged = merged.merge(df, on="player_id", how="outer")
 
-    # Coalesce n_press from any source (columns may be n_press, n_press_x, n_press_y)
     n_press_cols = [c for c in merged.columns if c == "n_press" or c.startswith("n_press_")]
     if n_press_cols:
         merged["n_press"] = merged[n_press_cols].bfill(axis=1).iloc[:, 0]
@@ -66,9 +63,8 @@ def main() -> None:
 
     rank_cols = [c for c in merged.columns if c.startswith("rank_")]
     merged["avg_rank"] = merged[rank_cols].mean(axis=1)
-    merged["composite_rank"] = merged["avg_rank"].rank(method="min").astype(int)  # lower avg_rank = better
+    merged["composite_rank"] = merged["avg_rank"].rank(method="min").astype(int)
 
-    # ---- Enrich with player names from first available result file ----
     for path in [RESULTS / "participation.csv", RESULTS / "distance.csv", RESULTS / "modeling.csv"]:
         if path.exists():
             src = pd.read_csv(path)

@@ -322,7 +322,7 @@ def main() -> None:
         print("Top distance credits:")
         print(pd.read_csv(dist_path).head(10).to_string(index=False))
     except FileNotFoundError:
-        print("Skipping distance allocation: hazard_features.parquet not found (run 03_features.py first)")
+        print("Skipping distance allocation: hazard_features.parquet not found (run 02_features.py first)")
 
     part_path = RESULTS_DIR / "participation.csv"
     _write_clean_csv(participation, "total_recovery_value_participation", part_path)

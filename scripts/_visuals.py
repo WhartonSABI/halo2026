@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
-EDA: Play through a game with puck location colored by zone.
+EDA visuals: slot-change audit, attribution spreads, contribution histograms,
+player ranking charts, modeling-vs-other scatter plots, game/press animations.
 
-Puck location colors:
+Puck location colors (for animations):
 - Red: Team A's defensive zone (x < -25)
 - Blue: Team B's defensive zone (x > 25)
 - Black: Neutral zone (-25 <= x <= 25)
@@ -356,7 +357,7 @@ def slot_change_audit() -> None:
     """Fraction of sequences where any slot_id changes across rows (stint relevance)."""
     path = PROCESSED_DIR / "hazard_features.parquet"
     if not path.exists():
-        print("slot_change_audit: hazard_features.parquet not found (run 03_features.py)")
+        print("slot_change_audit: hazard_features.parquet not found (run 02_features.py)")
         return
 
     df = pd.read_parquet(path)
@@ -424,7 +425,7 @@ def contribution_distributions() -> None:
     """Histograms of modeling contribution columns (pos_total, exec_total, check_total)."""
     path = RESULTS_DIR / "modeling.csv"
     if not path.exists():
-        print("contribution_distributions: modeling.csv not found (run 07_modeling.py)")
+        print("contribution_distributions: modeling.csv not found (run 05_modeling.py)")
         return
 
     m = pd.read_csv(path)
@@ -444,9 +445,9 @@ def contribution_distributions() -> None:
         ax.set_title(col)
         ax.set_xlabel("value")
 
-    plt.suptitle("Modeling contribution distributions (player-level)")
+    plt.suptitle("Contribution distributions (player-level)")
     plt.tight_layout()
-    out = PLOTS_DIR / "modeling_contribution_distributions.png"
+    out = PLOTS_DIR / "contribution_distributions.png"
     plt.savefig(out, dpi=150)
     plt.close()
     print(f"Saved: {out}")
@@ -483,12 +484,17 @@ def player_rankings_visual(top_n: int = 20) -> None:
     for ax, method in zip(axes, methods):
         sub = dfs[method]
         val_col = [c for c in sub.columns if c != "player_name"][0]
-        ax.barh(range(len(sub)), sub[val_col].values)
+        vals = sub[val_col].values
+        ax.barh(range(len(sub)), vals)
         ax.set_yticks(range(len(sub)))
         ax.set_yticklabels(sub["player_name"].values, fontsize=9)
         ax.invert_yaxis()
         ax.set_title(f"Top {top_n} — {method}")
-        ax.axvline(0, color="black", linestyle="-", linewidth=0.5)
+        v_min, v_max = vals.min(), vals.max()
+        margin = max((v_max - v_min) * 0.05, 1e-6) if v_max != v_min else 0.01
+        ax.set_xlim(v_min - margin, v_max + margin)
+        if v_min <= 0 <= v_max:
+            ax.axvline(0, color="black", linestyle="-", linewidth=0.5)
         ax.set_xlabel(val_col)
 
     plt.suptitle("Player rankings by attribution method")
@@ -501,9 +507,9 @@ def player_rankings_visual(top_n: int = 20) -> None:
 
 def player_press_distributions() -> None:
     """Possession-level spread of pos/exec/total from player_press.parquet."""
-    path = RESULTS_DIR / "player_press.parquet"
+    path = PROCESSED_DIR / "player_press.parquet"
     if not path.exists():
-        print("player_press_distributions: player_press.parquet not found (run 07_modeling.py)")
+        print("player_press_distributions: data/processed/player_press.parquet not found (run 05_modeling.py)")
         return
 
     pp = pd.read_parquet(path)
@@ -541,7 +547,7 @@ def player_press_distributions() -> None:
 
 
 def ranking_comparison_scatter() -> None:
-    """Scatter: modeling vs participation and modeling vs distance (top players)."""
+    """Scatter: model vs participation, model vs distance, distance vs participation."""
     paths = {
         "participation": RESULTS_DIR / "participation.csv",
         "distance": RESULTS_DIR / "distance.csv",
@@ -558,28 +564,31 @@ def ranking_comparison_scatter() -> None:
         if total_col in df.columns:
             dfs[name] = df[["player_id", total_col]].rename(columns={total_col: name})
 
-    if "modeling" not in dfs or len(dfs) < 2:
-        print("ranking_comparison_scatter: need modeling + at least one other method")
+    if len(dfs) < 2:
+        print("ranking_comparison_scatter: need at least 2 of modeling, participation, distance")
         return
 
-    m = dfs["modeling"]
-    for other in ["participation", "distance"]:
-        if other not in dfs:
+    PLOTS_DIR.mkdir(parents=True, exist_ok=True)
+    pairs = [
+        ("modeling", "participation", "model_vs_participation", "model", "participation"),
+        ("modeling", "distance", "model_vs_distance", "model", "distance"),
+        ("distance", "participation", "distance_vs_participation", "distance", "participation"),
+    ]
+    for x_name, y_name, out_name, x_label, y_label in pairs:
+        if x_name not in dfs or y_name not in dfs:
             continue
-        merged = m.merge(dfs[other], on="player_id", how="inner")
+        merged = dfs[x_name].merge(dfs[y_name], on="player_id", how="inner")
         if len(merged) < 5:
             continue
-
         fig, ax = plt.subplots(figsize=(8, 8))
-        ax.scatter(merged[other], merged["modeling"], alpha=0.6)
+        ax.scatter(merged[x_name], merged[y_name], alpha=0.6)
         ax.axhline(0, color="gray", linestyle="--")
         ax.axvline(0, color="gray", linestyle="--")
-        ax.set_xlabel(other)
-        ax.set_ylabel("modeling")
-        ax.set_title(f"Modeling vs {other} (player totals)")
+        ax.set_xlabel(x_label)
+        ax.set_ylabel(y_label)
+        ax.set_title(f"{x_label} vs {y_label} (player totals)")
         plt.tight_layout()
-        out = PLOTS_DIR / f"ranking_comparison_modeling_vs_{other}.png"
-        PLOTS_DIR.mkdir(parents=True, exist_ok=True)
+        out = PLOTS_DIR / f"{out_name}.png"
         plt.savefig(out, dpi=150)
         plt.close()
         print(f"Saved: {out}")
@@ -587,13 +596,13 @@ def ranking_comparison_scatter() -> None:
 
 def main() -> None:
     import argparse
-    parser = argparse.ArgumentParser(description="EDA for forecheck analysis")
-    parser.add_argument("--all", action="store_true", help="Run all EDA (default)")
+    parser = argparse.ArgumentParser(description="EDA visuals for forecheck analysis")
+    parser.add_argument("--all", action="store_true", help="Run all (default)")
     parser.add_argument("--possession", action="store_true", help="Possession time vs recovery")
     parser.add_argument("--gifs", action="store_true", help="Save longest press GIFs")
     parser.add_argument("--slot-audit", action="store_true", help="Slot-change audit")
     parser.add_argument("--spreads", action="store_true", help="Attribution positive/negative spreads")
-    parser.add_argument("--distributions", action="store_true", help="Modeling contribution histograms")
+    parser.add_argument("--distributions", action="store_true", help="Contribution histograms")
     parser.add_argument("--rankings", action="store_true", help="Top player bar charts")
     parser.add_argument("--player-press", action="store_true", help="Possession-level credit stats")
     parser.add_argument("--scatter", action="store_true", help="Modeling vs participation/distance scatter")

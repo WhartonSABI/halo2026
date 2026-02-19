@@ -1,7 +1,6 @@
-#!/usr/bin/env python3
-"""Hazard-model preprocessing and featurizing (pipeline step 5).
+"""Hazard-model preprocessing (shared by 04_tuning and 05_modeling).
 
-Used by 06_tuning.py and 07_modeling.py. Encodes:
+Encodes:
 - Time basis transforms (log, sqrt of elapsed time)
 - Column partitioning (numeric vs categorical, slot vs other)
 - Slot imputation with missingness indicators
@@ -30,6 +29,8 @@ SLOT_FEATURE_TEMPLATE = [
     "{slot}_r_nearestOpp",
     "{slot}_vr_nearestOpp",
 ]
+
+RANDOM_STATE = 7  # Must match 04_tuning and 05_modeling
 
 IGNORE_COLS = frozenset({
     "fc_sequence_id", "sl_event_id", "event_t", "terminal_failure_t",
@@ -66,6 +67,28 @@ def add_slot_imputed_indicators(df: pd.DataFrame) -> None:
             continue
         col = f"{slot}_imputed"
         df[col] = (df[existing].isna().any(axis=1)).astype(np.float64)
+
+
+def compute_start_meta(df: pd.DataFrame, time_col: str = "time_since_start_s") -> tuple[pd.Series, np.ndarray]:
+    """Return (start_index: seq_id -> row index, is_start_row: bool array)."""
+    ordering = pd.DataFrame({
+        "fc_sequence_id": df["fc_sequence_id"].values,
+        "time_since_start_s": df[time_col].astype(float).values,
+        "sl_event_id": df["sl_event_id"].values,
+    }, index=df.index)
+    start_rows = (
+        ordering.sort_values(["fc_sequence_id", "time_since_start_s", "sl_event_id"])
+        .groupby("fc_sequence_id", as_index=False)
+        .first()[["fc_sequence_id", "time_since_start_s", "sl_event_id"]]
+    )
+    start_index = (
+        ordering.reset_index()
+        .merge(start_rows, on=["fc_sequence_id", "time_since_start_s", "sl_event_id"], how="inner")
+        .drop_duplicates(subset=["fc_sequence_id"])
+        .set_index("fc_sequence_id")["index"]
+    )
+    is_start_row = np.asarray(df.index.isin(start_index.values), dtype=bool)
+    return start_index, is_start_row
 
 
 def build_feature_lists(df: pd.DataFrame) -> tuple[list[str], list[str]]:
@@ -128,47 +151,10 @@ def build_preprocessor(numeric_cols: list[str], cat_cols: list[str]) -> ColumnTr
 def build_model_prep_pipeline(
     numeric_cols: list[str], cat_cols: list[str]
 ) -> Pipeline:
-    """Build full preprocessing pipeline: TimeAugmenter + ColumnTransformer."""
+    """Full preprocessing pipeline: TimeAugmenter + ColumnTransformer.
+    Fit on train only for centered exec credit.
+    """
     return Pipeline([
         ("time_aug", TimeAugmenter()),
         ("prep", build_preprocessor(numeric_cols, cat_cols)),
     ])
-
-
-def run_preprocess() -> None:
-    """Produce model_features.parquet and model_preprocessor.joblib. Run once before 06/07."""
-    from pathlib import Path
-    from joblib import dump
-
-    project_root = Path(__file__).resolve().parent.parent
-    in_path = project_root / "data" / "processed" / "hazard_features.parquet"
-    out_path = project_root / "data" / "processed" / "model_features.parquet"
-    preproc_path = project_root / "data" / "processed" / "model_preprocessor.joblib"
-
-    if not in_path.exists():
-        raise FileNotFoundError(f"Run 03_features.py first: {in_path} not found")
-
-    df = pd.read_parquet(in_path)
-    add_slot_imputed_indicators(df)
-
-    numeric_cols, cat_cols = build_feature_lists(df)
-    pipeline = build_model_prep_pipeline(numeric_cols, cat_cols)
-
-    X_raw = df[numeric_cols + cat_cols]
-    X_processed = pipeline.fit_transform(X_raw)
-
-    feature_names = pipeline.named_steps["prep"].get_feature_names_out()
-    out_df = pd.DataFrame(X_processed, columns=list(feature_names))
-    for col in ["fc_sequence_id", "sl_event_id", "event_t", "terminal_failure_t"]:
-        out_df[col] = df[col].values
-
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_df.to_parquet(out_path, index=False)
-    dump(pipeline, preproc_path)
-
-    print(f"Saved {out_path} ({len(out_df):,} rows)")
-    print(f"Saved {preproc_path}")
-
-
-if __name__ == "__main__":
-    run_preprocess()
