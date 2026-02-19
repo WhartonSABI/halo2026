@@ -2,7 +2,7 @@
 """Train competing-risk hazard models for forecheck outcomes.
 
 Uses the best model from tuning_results.csv (06_tuning.py) when available;
-otherwise trains and compares logit, HistGradientBoosting, and XGBoost.
+otherwise trains and compares logit, RandomForest, HistGradientBoosting, and XGBoost.
 
 Target classes:
 - 0: no terminal event at this row
@@ -28,10 +28,16 @@ import argparse
 import ast
 import os
 import sys
+import warnings
 from pathlib import Path
 
+warnings.filterwarnings(
+    "ignore",
+    message=".*sklearn.utils.parallel.delayed.*",
+)
+
 import numpy as np
-from joblib import Parallel, delayed
+from joblib import Parallel, delayed, load
 from tqdm import tqdm
 import pandas as pd
 from sklearn.compose import ColumnTransformer
@@ -41,7 +47,7 @@ from sklearn.model_selection import GroupShuffleSplit
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder
 from sklearn.linear_model import LogisticRegression
-from sklearn.ensemble import GradientBoostingClassifier, HistGradientBoostingClassifier, RandomForestRegressor
+from sklearn.ensemble import HistGradientBoostingClassifier, RandomForestClassifier, RandomForestRegressor
 import xgboost as xgb
 
 import importlib.util
@@ -51,13 +57,13 @@ _preprocess = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_preprocess)
 FORECHECK_SLOTS = _preprocess.FORECHECK_SLOTS
 SLOT_FEATURE_TEMPLATE = _preprocess.SLOT_FEATURE_TEMPLATE
-TimeAugmenter = _preprocess.TimeAugmenter
 add_slot_imputed_indicators = _preprocess.add_slot_imputed_indicators
 build_feature_lists = _preprocess.build_feature_lists
-build_preprocessor = _preprocess.build_preprocessor
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-DATA_PATH = PROJECT_ROOT / "data" / "processed" / "hazard_features.parquet"
+HAZARD_PATH = PROJECT_ROOT / "data" / "processed" / "hazard_features.parquet"
+MODEL_FEATURES_PATH = PROJECT_ROOT / "data" / "processed" / "model_features.parquet"
+MODEL_PREPROCESSOR_PATH = PROJECT_ROOT / "data" / "processed" / "model_preprocessor.joblib"
 OUT_DIR = PROJECT_ROOT / "data" / "processed"
 RESULTS_DIR = PROJECT_ROOT / "data" / "results"
 RAW_DIR = PROJECT_ROOT / "data" / "raw"
@@ -69,7 +75,7 @@ GHOST_DRAWS = 10  # B draws per row; average credits for E[credit] under ghost d
 
 def load_data() -> pd.DataFrame:
     """Load hazard features and define 3-class target: ongoing(0), success(1), failure(2)."""
-    df = pd.read_parquet(DATA_PATH)
+    df = pd.read_parquet(HAZARD_PATH)
     y = np.zeros(len(df), dtype=np.int64)
     y[df["event_t"].eq(1).values] = 1  # terminal success
     y[df["terminal_failure_t"].eq(1).values] = 2  # terminal failure
@@ -88,7 +94,7 @@ def load_tuned_params() -> dict[str, dict]:
     """Load best hyperparameters from tuning_results.csv (from 06_tuning.py).
 
     Returns dict mapping model name to param dict (without model__ prefix).
-    Model names: hist_gbm, gbm, xgboost. Falls back to empty dict if file missing.
+    Model names: rf, hist_gbm, xgboost. Falls back to empty dict if file missing.
     """
     path = RESULTS_DIR / "tuning_results.csv"
     if not path.exists():
@@ -112,7 +118,7 @@ def load_best_model_from_tuning() -> tuple[str, dict] | None:
     """Load best model name and params from tuning_results.csv (sorted by test_log_loss).
 
     Returns (model_name, params) or None if tuning_results missing/empty.
-    Model names: hist_gbm, gbm, xgboost.
+    Model names: rf, hist_gbm, xgboost.
     """
     path = RESULTS_DIR / "tuning_results.csv"
     if not path.exists():
@@ -131,10 +137,10 @@ def load_best_model_from_tuning() -> tuple[str, dict] | None:
     return (name, params)
 
 
-def _build_model(name: str, params: dict, preprocessor: ColumnTransformer) -> Pipeline:
-    """Build a single hazard model pipeline. name: hist_gbm, gbm, or xgboost."""
+def _build_estimator(name: str, params: dict):
+    """Build estimator only (for training on preprocessed X)."""
     hist_keys = {"max_depth", "learning_rate", "max_iter", "min_samples_leaf", "l2_regularization", "max_bins"}
-    gbm_keys = {"max_depth", "learning_rate", "n_estimators", "min_samples_leaf", "subsample", "max_features"}
+    rf_keys = {"n_estimators", "max_depth", "min_samples_leaf", "max_features"}
     xgb_keys = {"max_depth", "learning_rate", "n_estimators", "min_child_weight", "subsample", "colsample_bytree", "reg_alpha", "reg_lambda"}
 
     if name == "hist_gbm":
@@ -142,10 +148,11 @@ def _build_model(name: str, params: dict, preprocessor: ColumnTransformer) -> Pi
             random_state=RANDOM_STATE,
             **{k: v for k, v in params.items() if k in hist_keys},
         )
-    elif name == "gbm":
-        estimator = GradientBoostingClassifier(
+    elif name == "rf":
+        estimator = RandomForestClassifier(
             random_state=RANDOM_STATE,
-            **{k: v for k, v in params.items() if k in gbm_keys},
+            n_jobs=-1,
+            **{k: v for k, v in params.items() if k in rf_keys},
         )
     elif name == "xgboost":
         estimator = xgb.XGBClassifier(
@@ -157,10 +164,13 @@ def _build_model(name: str, params: dict, preprocessor: ColumnTransformer) -> Pi
         )
     else:
         raise ValueError(f"Unknown model: {name}")
+    return estimator
 
+
+def _wrap_for_prediction(estimator, preprocessor_pipeline: Pipeline) -> Pipeline:
+    """Wrap preprocessor + fitted model for predict_proba on raw input."""
     return Pipeline([
-        ("time_aug", TimeAugmenter()),
-        ("prep", preprocessor),
+        ("prep", preprocessor_pipeline),
         ("model", estimator),
     ])
 
@@ -812,8 +822,14 @@ def main() -> None:
 
     # ---- Data loading and splitting ----
     print("[1/5] Loading data and splitting...")
-    df = load_data()
+    if not MODEL_FEATURES_PATH.exists() or not MODEL_PREPROCESSOR_PATH.exists():
+        raise FileNotFoundError(
+            "Run 05_preprocess.py first to create model_features.parquet and model_preprocessor.joblib"
+        )
+    preprocessor_pipeline = load(MODEL_PREPROCESSOR_PATH)
+    model_feat = pd.read_parquet(MODEL_FEATURES_PATH)
 
+    df = load_data()
     if args.max_rows is not None:
         seq_ids = df["fc_sequence_id"].unique()
         rng = np.random.default_rng(RANDOM_STATE)
@@ -821,6 +837,7 @@ def main() -> None:
         n_seq = max(1, min(len(seq_ids), int(args.max_rows / mean_per_seq)))
         keep_seq = rng.choice(seq_ids, size=n_seq, replace=False)
         df = df[df["fc_sequence_id"].isin(keep_seq)].copy()
+        model_feat = model_feat[model_feat["fc_sequence_id"].isin(keep_seq)]
         print(f"  Subsampled to {len(df):,} rows ({n_seq} sequences)")
 
     add_slot_imputed_indicators(df)
@@ -828,13 +845,26 @@ def main() -> None:
     print(f"  Train: {len(train_df):,} rows, Test: {len(test_df):,} rows")
 
     numeric_cols, cat_cols = build_feature_lists(df)
+    meta_cols = {"fc_sequence_id", "sl_event_id", "event_t", "terminal_failure_t"}
+    feat_cols = [c for c in model_feat.columns if c not in meta_cols]
 
-    X_train = train_df[numeric_cols + cat_cols]
-    y_train = train_df["target_class"]
-    X_test = test_df[numeric_cols + cat_cols]
-    y_test = test_df["target_class"]
+    # Preprocessed X for model training (from 05)
+    train_ids = set(train_df["fc_sequence_id"].unique())
+    test_ids = set(test_df["fc_sequence_id"].unique())
+    idx_train = model_feat["fc_sequence_id"].isin(train_ids)
+    idx_test = model_feat["fc_sequence_id"].isin(test_ids)
+    X_train = model_feat.loc[idx_train, feat_cols]
+    X_test = model_feat.loc[idx_test, feat_cols]
+    y_train = np.zeros(idx_train.sum(), dtype=np.int64)
+    y_train[model_feat.loc[idx_train, "event_t"].eq(1).values] = 1
+    y_train[model_feat.loc[idx_train, "terminal_failure_t"].eq(1).values] = 2
+    y_test = np.zeros(idx_test.sum(), dtype=np.int64)
+    y_test[model_feat.loc[idx_test, "event_t"].eq(1).values] = 1
+    y_test[model_feat.loc[idx_test, "terminal_failure_t"].eq(1).values] = 2
 
-    preprocessor = build_preprocessor(numeric_cols, cat_cols)
+    # Raw X for slot predictors and crediting
+    X_train_raw = train_df[numeric_cols + cat_cols]
+    X_test_raw = test_df[numeric_cols + cat_cols]
 
     # ---- Train hazard model ----
     # Use tuning winner when available; else train all three and pick best.
@@ -846,10 +876,11 @@ def main() -> None:
     if tuning_choice is not None:
         best_model_name, best_params = tuning_choice
         print(f"\n[2/5] Training {best_model_name} (from tuning_results.csv)...")
-        pipe = _build_model(best_model_name, best_params, preprocessor)
-        pipe.fit(X_train, y_train)
+        est = _build_estimator(best_model_name, best_params)
+        est.fit(X_train, y_train)
+        pipe = _wrap_for_prediction(est, preprocessor_pipeline)
         fitted_models[best_model_name] = pipe
-        proba = pipe.predict_proba(X_test)
+        proba = pipe.predict_proba(X_test_raw)
         ll = log_loss(y_test, proba, labels=[0, 1, 2])
         summary = pd.DataFrame([{
             "model": best_model_name,
@@ -861,16 +892,22 @@ def main() -> None:
         print("\n[2/5] Training hazard models (no tuning_results.csv; comparing all)...")
         tuned = load_tuned_params()
         hist_defaults = {"max_depth": 8, "learning_rate": 0.05, "max_iter": 300}
+        rf_defaults = {"n_estimators": 300, "max_depth": 10, "min_samples_leaf": 10}
         xgb_defaults = {
             "max_depth": 8, "learning_rate": 0.05, "n_estimators": 800,
             "min_child_weight": 5, "subsample": 0.8, "colsample_bytree": 1.0,
             "reg_alpha": 1.0, "reg_lambda": 1.0,
         }
         hist_params = {**hist_defaults, **(tuned.get("hist_gbm") or {})}
+        rf_params = {**rf_defaults, **(tuned.get("rf") or {})}
         xgb_params = {**xgb_defaults, **(tuned.get("xgboost") or {})}
 
         models = {
             "multinomial_logit": LogisticRegression(max_iter=1000, class_weight="balanced", random_state=RANDOM_STATE),
+            "rf": RandomForestClassifier(
+                random_state=RANDOM_STATE, n_jobs=-1,
+                **{k: v for k, v in rf_params.items() if k in {"n_estimators", "max_depth", "min_samples_leaf", "max_features"}},
+            ),
             "gbm_hist": HistGradientBoostingClassifier(
                 random_state=RANDOM_STATE,
                 **{k: v for k, v in hist_params.items() if k in {"max_depth", "learning_rate", "max_iter", "min_samples_leaf", "l2_regularization", "max_bins"}},
@@ -882,14 +919,10 @@ def main() -> None:
         }
         rows = []
         for name, estimator in tqdm(models.items(), desc="  Models", unit="model", file=sys.stdout):
-            pipe = Pipeline([
-                ("time_aug", TimeAugmenter()),
-                ("prep", preprocessor),
-                ("model", estimator),
-            ])
-            pipe.fit(X_train, y_train)
+            estimator.fit(X_train, y_train)
+            pipe = _wrap_for_prediction(estimator, preprocessor_pipeline)
             fitted_models[name] = pipe
-            rows.append(evaluate_model(name, pipe, X_test, y_test))
+            rows.append(evaluate_model(name, pipe, X_test_raw, pd.Series(y_test)))
         summary = pd.DataFrame(rows).sort_values("log_loss")
         best_model_name = summary.iloc[0]["model"]
 
@@ -902,7 +935,7 @@ def main() -> None:
     # ---- Fit per-slot RF predictors for counterfactual replacement ----
     print("\n[3/5] Fitting slot predictors (RF per slot, start vs exec ghosts)...")
     _, train_is_start = _compute_start_meta(train_df)
-    slot_predictors = fit_slot_predictors(X_train, numeric_cols, cat_cols, train_is_start)
+    slot_predictors = fit_slot_predictors(X_train_raw, numeric_cols, cat_cols, train_is_start)
     print(f"  Fitted: {list(slot_predictors.keys())}")
     print(f"  Averaging credits over {GHOST_DRAWS} ghost draws per row")
 
