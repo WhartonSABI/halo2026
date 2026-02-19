@@ -1,10 +1,8 @@
 #!/usr/bin/env python3
 """Train competing-risk hazard models for forecheck outcomes.
 
-This script fits three event-level classifiers over hazard rows:
-1) Multinomial logistic regression (baseline, interpretable)
-2) Histogram gradient boosting (sklearn GBM)
-3) XGBoost (tuned via 06_tuning.py; see README)
+Uses the best model from tuning_results.csv (06_tuning.py) when available;
+otherwise trains and compares logit, HistGradientBoosting, and XGBoost.
 
 Target classes:
 - 0: no terminal event at this row
