@@ -57,6 +57,17 @@ class TimeAugmenter:
         return np.asarray(list(input_features) + ["log_time_since_start_s", "sqrt_time_since_start_s"])
 
 
+def add_slot_imputed_indicators(df: pd.DataFrame) -> None:
+    """Add F1_imputed, F2_imputed, ... columns (1 where that slot has any NaN). In-place."""
+    for slot in FORECHECK_SLOTS:
+        slot_cols = [t.format(slot=slot) for t in SLOT_FEATURE_TEMPLATE]
+        existing = [c for c in slot_cols if c in df.columns]
+        if not existing:
+            continue
+        col = f"{slot}_imputed"
+        df[col] = (df[existing].isna().any(axis=1)).astype(np.float64)
+
+
 def build_feature_lists(df: pd.DataFrame) -> tuple[list[str], list[str]]:
     """Partition hazard-feature columns into numeric and categorical."""
     feature_cols = [c for c in df.columns if c not in IGNORE_COLS]
@@ -85,7 +96,7 @@ def build_preprocessor(numeric_cols: list[str], cat_cols: list[str]) -> ColumnTr
     ]
 
     slot_pipe = Pipeline([
-        ("imputer", SimpleImputer(strategy="mean", add_indicator=True)),
+        ("imputer", SimpleImputer(strategy="mean")),
         ("scaler", StandardScaler()),
     ])
     other_num_pipe = Pipeline([

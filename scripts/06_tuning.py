@@ -27,6 +27,7 @@ _spec = importlib.util.spec_from_file_location("preprocess", _preprocess_path)
 _preprocess = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_preprocess)
 TimeAugmenter = _preprocess.TimeAugmenter
+add_slot_imputed_indicators = _preprocess.add_slot_imputed_indicators
 build_feature_lists = _preprocess.build_feature_lists
 build_preprocessor = _preprocess.build_preprocessor
 
@@ -137,6 +138,7 @@ def main() -> None:
 
     print("Loading data...")
     df = load_data()
+    add_slot_imputed_indicators(df)
     train_df, test_df = split_groups(df)
 
     numeric_cols, cat_cols = build_feature_lists(df)

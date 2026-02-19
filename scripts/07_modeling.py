@@ -29,9 +29,13 @@ Player crediting logic (value of a press):
 from __future__ import annotations
 
 import ast
+import os
+import sys
 from pathlib import Path
 
 import numpy as np
+from joblib import Parallel, delayed
+from tqdm import tqdm
 import pandas as pd
 from sklearn.compose import ColumnTransformer
 from sklearn.impute import SimpleImputer
@@ -51,6 +55,7 @@ _spec.loader.exec_module(_preprocess)
 FORECHECK_SLOTS = _preprocess.FORECHECK_SLOTS
 SLOT_FEATURE_TEMPLATE = _preprocess.SLOT_FEATURE_TEMPLATE
 TimeAugmenter = _preprocess.TimeAugmenter
+add_slot_imputed_indicators = _preprocess.add_slot_imputed_indicators
 build_feature_lists = _preprocess.build_feature_lists
 build_preprocessor = _preprocess.build_preprocessor
 
@@ -61,8 +66,8 @@ RESULTS_DIR = PROJECT_ROOT / "data" / "results"
 RAW_DIR = PROJECT_ROOT / "data" / "raw"
 
 RANDOM_STATE = 7
-GHOST_DRAWS = 20  # B draws per row; average credits for E[credit] under ghost distribution
-B_IMPUTE = 20  # Multiple-imputation draws for rows with missing slot features
+N_JOBS = min(12, os.cpu_count() or 12)  # Parallel workers for row chunks and slots
+GHOST_DRAWS = 10  # B draws per row; average credits for E[credit] under ghost distribution
 
 
 def load_data() -> pd.DataFrame:
@@ -198,7 +203,7 @@ def fit_slot_predictors(
     slot_predictors: dict[str, tuple[Pipeline, LeafResampleGhost, list[str]]] = {}
     rf_params = dict(n_estimators=100, max_depth=8, random_state=RANDOM_STATE, n_jobs=-1)
 
-    for slot in FORECHECK_SLOTS:
+    for slot in tqdm(FORECHECK_SLOTS, desc="Slot predictors", unit="slot", file=sys.stdout):
         slot_id = f"{slot}_id"
         slot_cols = _get_slot_cols(slot, X_train)
         if not slot_cols:
@@ -261,8 +266,10 @@ def _rf_slot_replacement(
 ) -> tuple[pd.DataFrame, np.ndarray]:
     """Counterfactual: replace slot features with ghost from same leaf.
 
+    Preserves missingness pattern: only overwrites values that were originally observed,
+    leaves NaNs as NaNs so base and CF have identical missing indicators.
+
     Returns (cf, valid_mask). valid_mask[i]=True where we found a sample.
-    For invalid rows, cf keeps original features (credit=0 for that draw).
     """
     cf = df.copy()
     slot_id = f"{slot}_id"
@@ -275,122 +282,130 @@ def _rf_slot_replacement(
     if slot_id in cf.columns:
         cf[slot_id] = np.nan
 
+    # Only process rows with at least one observed slot feature
+    observed_any = cf[slot_cols].notna().any(axis=1)
+    if not observed_any.any():
+        return cf, valid_mask
+
     pipeline, ghost, input_cols = slot_predictor
     input_cols = [c for c in input_cols if c in df.columns]
-    X_in = df[input_cols]
+    X_in = df.loc[observed_any, input_cols]
     X_processed = pipeline.named_steps["preprocess"].transform(X_in)
     if hasattr(X_processed, "toarray"):
         X_processed = X_processed.toarray()
     samples, valid = ghost.sample(np.asarray(X_processed), B=1)
-    valid_mask = valid[0]
-    if valid_mask.any():
-        cf.loc[valid_mask, slot_cols] = samples[0][valid_mask]
+    sample_valid = valid[0]
+    # Map valid back to full row index
+    valid_mask[observed_any] = sample_valid
+
+    if sample_valid.any():
+        valid_indices = df.index[observed_any][sample_valid]
+        pred = samples[0][sample_valid]  # (n_valid_rows, n_slot_features)
+        pred_df = pd.DataFrame(pred, index=valid_indices, columns=slot_cols)
+        # Only overwrite values that were originally present (keep NaNs as NaNs)
+        for col in slot_cols:
+            m = df[col].notna() & df.index.isin(valid_indices)
+            if m.any():
+                cf.loc[m, col] = pred_df.loc[df.index[m], col].values
     return cf, valid_mask
 
 
-def _get_missing_slots_per_row(
+def _fill_missing_slots_with_rf(
     X: pd.DataFrame,
-    slot_predictors: dict[str, tuple],
-) -> tuple[np.ndarray, dict[int, set[str]]]:
-    """Identify which rows have missing slot features and which slots are missing per row.
-
-    Returns (rows_fully_observed_mask, missing_slots_per_row).
-    rows_fully_observed_mask[i] = True if row i has no missing slot features.
-    missing_slots_per_row[i] = set of slot names with any NaN for row i (only for slots with predictors).
-    """
-    n = len(X)
-    rows_fully_observed = np.ones(n, dtype=bool)
-    missing_slots_per_row: dict[int, set[str]] = {}
-
+    slot_predictors: dict[str, tuple[Pipeline, LeafResampleGhost, list[str]]],
+    exclude_slot: str | None = None,
+) -> pd.DataFrame:
+    """Fill missing slot features with conditional RF prediction (E[slot|X]). Returns a copy."""
+    out = X.copy()
     for slot, pred in slot_predictors.items():
+        if slot == exclude_slot:
+            continue
+        pipeline, _, input_cols = pred
         slot_cols = _get_slot_cols(slot, X)
         if not slot_cols:
             continue
-        is_missing = X[slot_cols].isna().any(axis=1)
-        rows_fully_observed &= ~is_missing
-        for i in np.where(is_missing)[0]:
-            missing_slots_per_row.setdefault(int(i), set()).add(slot)
-
-    return rows_fully_observed, missing_slots_per_row
-
-
-def _fill_missing_slots_one_draw(
-    row: pd.DataFrame,
-    missing_slots: set[str],
-    slot_predictors: dict,
-    rng: np.random.Generator,
-) -> pd.DataFrame:
-    """Fill missing slots with one ghost draw each. Returns 1-row DataFrame."""
-    filled = row.copy()
-    for slot in missing_slots:
-        pred = slot_predictors.get(slot)
-        if pred is None:
-            continue
-        pipeline, ghost, input_cols = pred
-        slot_cols = _get_slot_cols(slot, row)
-        if not slot_cols:
-            continue
-        input_cols = [c for c in input_cols if c in row.columns]
+        input_cols = [c for c in input_cols if c in X.columns]
         if not input_cols:
             continue
-        X_in = filled[input_cols]
-        X_processed = pipeline.named_steps["preprocess"].transform(X_in)
-        if hasattr(X_processed, "toarray"):
-            X_processed = np.asarray(X_processed)
-        samples, valid = ghost.sample(X_processed, B=1)
-        if valid.any():
-            filled.loc[:, slot_cols] = samples[0][0]
-    return filled
-
-
-BATCH_CHUNK_SIZE = 50_000  # Chunk large batches to avoid memory blow-up
-
-
-def _score_with_multi_impute_batched(
-    model: Pipeline,
-    X: pd.DataFrame,
-    row_indices: np.ndarray,
-    missing_slots_per_row: dict[int, set[str]],
-    slot_predictors: dict,
-    rng: np.random.Generator,
-    B: int,
-) -> np.ndarray:
-    """Score rows with missing slots via batched multi-imputation.
-
-    Builds n*B filled rows, runs batched predict_proba (chunked if needed), returns mean V per row.
-    """
-    if len(row_indices) == 0:
-        return np.array([])
-
-    filled_rows: list[pd.DataFrame] = []
-    row_ids: list[int] = []
-    for i in row_indices:
-        missing = missing_slots_per_row.get(i, set())
-        if not missing:
-            filled_rows.append(X.iloc[[i]].copy())
-            row_ids.append(i)
+        is_missing = X[slot_cols].isna().any(axis=1)
+        if not is_missing.any():
             continue
-        for _ in range(B):
-            filled = _fill_missing_slots_one_draw(
-                X.iloc[[i]], missing, slot_predictors, rng
-            )
-            filled_rows.append(filled)
-            row_ids.append(i)
-
-    X_batch = pd.concat(filled_rows, ignore_index=True)
-    row_ids_arr = np.array(row_ids)
-
-    pv_all = np.zeros(len(X_batch), dtype=float)
-    for start in range(0, len(X_batch), BATCH_CHUNK_SIZE):
-        end = min(start + BATCH_CHUNK_SIZE, len(X_batch))
-        proba = model.predict_proba(X_batch.iloc[start:end])
-        pv_all[start:end] = proba[:, 1] - proba[:, 2]
-
-    out = np.zeros(len(row_indices), dtype=float)
-    for k, i in enumerate(row_indices):
-        mask = row_ids_arr == i
-        out[k] = np.mean(pv_all[mask])
+        X_in = out[input_cols]
+        pred_vals = pipeline.predict(X_in)
+        out.loc[is_missing, slot_cols] = pred_vals[is_missing]
     return out
+
+
+def _credit_one_slot(
+    slot_rank: int,
+    slot: str,
+    model: Pipeline,
+    source_df: pd.DataFrame,
+    X_source: pd.DataFrame,
+    slot_predictors: dict,
+    base_press_value: np.ndarray,
+    base_start_by_seq: pd.Series,
+    start_index: pd.Series,
+) -> pd.DataFrame:
+    """Compute credits for one slot (all ghost draws). Used by Parallel over slots."""
+    slot_id = f"{slot}_id"
+    pred = slot_predictors[slot]
+
+    acc_total = np.zeros(len(source_df))
+    acc_start = np.zeros(len(source_df))
+    acc_exec = np.zeros(len(source_df))
+    acc_count = np.zeros(len(source_df))
+
+    for draw_idx in range(GHOST_DRAWS):
+        cf_features, valid_mask = _rf_slot_replacement(X_source, slot, pred)
+        # Fill remaining missing slots (others besides the crediting slot) with RF prediction
+        cf_features = _fill_missing_slots_with_rf(
+            cf_features, slot_predictors, exclude_slot=slot
+        )
+
+        cf_press_value = base_press_value.copy()
+        if np.any(valid_mask):
+            cf_proba = model.predict_proba(cf_features.loc[valid_mask])
+            cf_press_value[valid_mask] = cf_proba[:, 1] - cf_proba[:, 2]
+
+        cf_start_by_seq = pd.Series(cf_press_value, index=source_df.index).loc[start_index.values]
+        cf_start_by_seq.index = start_index.index
+
+        total_credit = base_press_value - cf_press_value
+        base_start_aligned = source_df["fc_sequence_id"].map(base_start_by_seq).to_numpy(dtype=float)
+        cf_start_aligned = source_df["fc_sequence_id"].map(cf_start_by_seq).to_numpy(dtype=float)
+        start_positioning_credit = base_start_aligned - cf_start_aligned
+        execution_credit = total_credit - start_positioning_credit
+
+        acc_total += total_credit
+        acc_start += start_positioning_credit
+        acc_exec += execution_credit
+        acc_count += valid_mask
+
+    denom = np.maximum(acc_count, 1)
+    total_credit = acc_total / denom
+    start_positioning_credit = acc_start / denom
+    execution_credit = acc_exec / denom
+
+    # Fully-missing frames: no evidence, avoid artificial execution penalty (-start)
+    slot_cols = _get_slot_cols(slot, X_source)
+    if slot_cols:
+        fully_missing = X_source[slot_cols].isna().all(axis=1).to_numpy()
+        execution_credit[fully_missing] = np.nan
+        total_credit[fully_missing] = np.nan
+
+    slot_frame = pd.DataFrame(
+        {
+            "player_id": source_df[slot_id].values,
+            "fc_sequence_id": source_df["fc_sequence_id"].values,
+            "sl_event_id": source_df["sl_event_id"].values,
+            "slot": slot,
+            "start_positioning_credit": start_positioning_credit,
+            "execution_credit": execution_credit,
+            "total_press_credit": total_credit,
+        }
+    )
+    return slot_frame.dropna(subset=["player_id"])
 
 
 def build_player_press_credit(
@@ -405,39 +420,15 @@ def build_player_press_credit(
     - start_positioning_credit: effect on sequence-start press value
     - execution_credit: remaining effect beyond sequence start
     - total_press_credit: start_positioning_credit + execution_credit
-
-    Rows with missing slot features use multiple imputation (draw B from ghost, average V).
     """
-    rng = np.random.default_rng(RANDOM_STATE)
-    n = len(X_source)
-
-    # Identify rows with missing slot features
-    rows_fully_observed = np.ones(n, dtype=bool)
-    missing_slots_per_row: dict[int, set[str]] = {}
+    # Fill missing slot features with conditional RF prediction before scoring
     if slot_predictors:
-        rows_fully_observed, missing_slots_per_row = _get_missing_slots_per_row(
-            X_source, slot_predictors
-        )
+        X_for_base = _fill_missing_slots_with_rf(X_source, slot_predictors)
+    else:
+        X_for_base = X_source
 
-    # Base press value: single score for fully observed, multi-impute for missing
-    base_press_value = np.zeros(n, dtype=float)
-    if np.any(rows_fully_observed):
-        base_proba = model.predict_proba(X_source.loc[rows_fully_observed])
-        base_press_value[rows_fully_observed] = (
-            base_proba[:, 1] - base_proba[:, 2]
-        )
-    rows_with_missing = ~rows_fully_observed
-    if np.any(rows_with_missing) and slot_predictors:
-        missing_idx = np.where(rows_with_missing)[0]
-        base_press_value[rows_with_missing] = _score_with_multi_impute_batched(
-            model,
-            X_source,
-            missing_idx,
-            missing_slots_per_row,
-            slot_predictors,
-            rng,
-            B_IMPUTE,
-        )
+    base_proba = model.predict_proba(X_for_base)
+    base_press_value = base_proba[:, 1] - base_proba[:, 2]  # P(success) - P(failure)
 
     # Identify sequence-start row per fc_sequence_id (earliest elapsed time; tie-break by event id)
     ordering = pd.DataFrame(
@@ -463,88 +454,28 @@ def build_player_press_credit(
     base_start_by_seq = pd.Series(base_press_value, index=source_df.index).loc[start_index.values]
     base_start_by_seq.index = start_index.index
 
-    # For each forechecker slot F1..F5, compute leave-one-out credit
-    # Average over valid draws; divide by valid count (not total draws).
-    credit_rows: list[pd.DataFrame] = []
-    for slot in FORECHECK_SLOTS:
-        slot_id = f"{slot}_id"
-        if slot_id not in source_df.columns:
-            continue
-
-        pred = slot_predictors.get(slot) if slot_predictors else None
-        if pred is None:
-            continue
-
-        acc_total = np.zeros(len(source_df))
-        acc_start = np.zeros(len(source_df))
-        acc_exec = np.zeros(len(source_df))
-        acc_count = np.zeros(len(source_df))
-
-        # Rows that have other slots missing (besides the one we're crediting)
-        other_missing_mask = np.array([
-            bool((missing_slots_per_row.get(i, set()) - {slot}))
-            for i in range(len(source_df))
-        ])
-
-        for _ in range(GHOST_DRAWS):
-            cf_features, valid_mask = _rf_slot_replacement(X_source, slot, pred)
-
-            # CF press value: init with base (credit=0 when invalid); overwrite for valid rows
-            cf_press_value = base_press_value.copy()
-            needs_single = valid_mask & ~other_missing_mask
-            if np.any(needs_single):
-                cf_proba = model.predict_proba(cf_features.loc[needs_single])
-                pv = cf_proba[:, 1] - cf_proba[:, 2]
-                cf_press_value[needs_single] = pv
-            needs_multi = valid_mask & other_missing_mask
-            if np.any(needs_multi) and slot_predictors:
-                other_missing_idx = np.where(needs_multi)[0]
-                other_missing_per_row = {
-                    idx: missing_slots_per_row.get(idx, set()) - {slot}
-                    for idx in other_missing_idx
-                }
-                cf_press_value[other_missing_idx] = _score_with_multi_impute_batched(
-                    model,
-                    cf_features,
-                    other_missing_idx,
-                    other_missing_per_row,
-                    slot_predictors,
-                    rng,
-                    B_IMPUTE,
-                )
-
-            cf_start_by_seq = pd.Series(cf_press_value, index=source_df.index).loc[start_index.values]
-            cf_start_by_seq.index = start_index.index
-
-            total_credit = base_press_value - cf_press_value
-            base_start_aligned = source_df["fc_sequence_id"].map(base_start_by_seq).to_numpy(dtype=float)
-            cf_start_aligned = source_df["fc_sequence_id"].map(cf_start_by_seq).to_numpy(dtype=float)
-            start_positioning_credit = base_start_aligned - cf_start_aligned
-            execution_credit = total_credit - start_positioning_credit
-
-            acc_total += total_credit
-            acc_start += start_positioning_credit
-            acc_exec += execution_credit
-            acc_count += valid_mask
-
-        denom = np.maximum(acc_count, 1)
-        total_credit = acc_total / denom
-        start_positioning_credit = acc_start / denom
-        execution_credit = acc_exec / denom
-
-        slot_frame = pd.DataFrame(
-            {
-                "player_id": source_df[slot_id].values,
-                "fc_sequence_id": source_df["fc_sequence_id"].values,
-                "sl_event_id": source_df["sl_event_id"].values,
-                "slot": slot,
-                "start_positioning_credit": start_positioning_credit,
-                "execution_credit": execution_credit,
-                "total_press_credit": total_credit,
-            }
+    # For each forechecker slot F1..F5, compute leave-one-out credit in parallel
+    slot_tasks = [
+        (rank, slot)
+        for rank, slot in enumerate(FORECHECK_SLOTS)
+        if f"{slot}_id" in source_df.columns
+        and slot_predictors.get(slot) is not None
+    ]
+    tqdm.write(f"  Crediting {len(slot_tasks)} slots in parallel (n_jobs={N_JOBS})...")
+    credit_rows = Parallel(n_jobs=N_JOBS, backend="loky")(
+        delayed(_credit_one_slot)(
+            slot_rank=rank,
+            slot=slot,
+            model=model,
+            source_df=source_df,
+            X_source=X_source,
+            slot_predictors=slot_predictors,
+            base_press_value=base_press_value,
+            base_start_by_seq=base_start_by_seq,
+            start_index=start_index,
         )
-        slot_frame = slot_frame.dropna(subset=["player_id"])
-        credit_rows.append(slot_frame)
+        for rank, slot in slot_tasks
+    )
 
     if not credit_rows:
         return pd.DataFrame(
@@ -565,6 +496,8 @@ def build_player_press_credit(
             execution=("execution_credit", "mean"),  # avg gain/loss over frames player is in
         )
     )
+    # execution=nan for fully-missing frames (no evidence); treat as 0 in total
+    per_press["execution"] = per_press["execution"].fillna(0.0)
     per_press["total_in_press"] = per_press["positioning"] + per_press["execution"]
 
     # Sum across presses for player totals
@@ -614,8 +547,11 @@ def _write_clean_csv(credit: pd.DataFrame, out_path: Path) -> None:
 
 def main() -> None:
     # ---- Data loading and splitting ----
+    print("[1/5] Loading data and splitting...")
     df = load_data()
+    add_slot_imputed_indicators(df)
     train_df, test_df = split_groups(df)
+    print(f"  Train: {len(train_df):,} rows, Test: {len(test_df):,} rows")
 
     numeric_cols, cat_cols = build_feature_lists(df)
 
@@ -627,6 +563,7 @@ def main() -> None:
     preprocessor = build_preprocessor(numeric_cols, cat_cols)
 
     # ---- Train competing models ----
+    print("\n[2/5] Training hazard models...")
     tuned = load_tuned_params()
     if tuned:
         print("Loaded tuned params from tuning_results.csv")
@@ -666,7 +603,7 @@ def main() -> None:
 
     rows = []
     fitted_models: dict[str, Pipeline] = {}
-    for name, estimator in models.items():
+    for name, estimator in tqdm(models.items(), desc="  Models", unit="model", file=sys.stdout):
         pipe = Pipeline(
             steps=[
                 ("time_aug", TimeAugmenter()),
@@ -683,21 +620,24 @@ def main() -> None:
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     out_path = RESULTS_DIR / "model_summary.csv"
     summary.to_csv(out_path, index=False)
+    print(f"  Best: {summary.iloc[0]['model']} (log_loss={summary.iloc[0]['log_loss']:.4f})")
 
     # ---- Fit per-slot RF predictors for counterfactual replacement ----
-    print("\nFitting slot predictors (RF per slot)...")
+    print("\n[3/5] Fitting slot predictors (RF per slot)...")
     slot_predictors = fit_slot_predictors(X_train, numeric_cols, cat_cols)
-    print(f"  Fitted predictors for slots: {list(slot_predictors.keys())}")
+    print(f"  Fitted: {list(slot_predictors.keys())}")
     print(f"  Averaging credits over {GHOST_DRAWS} ghost draws per row")
 
     # ---- Player attribution from best model ----
+    print("\n[4/5] Computing player credits...")
     best_model_name = summary.iloc[0]["model"]
     best_model = fitted_models[best_model_name]
     player_credit = build_player_press_credit(best_model, test_df, X_test, slot_predictors)
     model_out = RESULTS_DIR / "modeling.csv"
     _write_clean_csv(player_credit, model_out)
 
-    print("\nSaved model summary:", out_path)
+    print("\n[5/5] Done.")
+    print("  Saved model summary:", out_path)
     print("Saved modeling ranking:", model_out)
     print(summary)
 
