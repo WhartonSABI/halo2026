@@ -422,29 +422,38 @@ def attribution_spreads() -> None:
 
 
 def contribution_distributions() -> None:
-    """Histograms of modeling contribution columns (pos_total, exec_total, check_total)."""
-    path = RESULTS_DIR / "modeling.csv"
-    if not path.exists():
-        print("contribution_distributions: modeling.csv not found (run 05_modeling.py)")
-        return
-
-    m = pd.read_csv(path)
-    cols = [c for c in ["pos_total", "exec_total", "check_total"] if c in m.columns]
-    if not cols:
+    """Histograms: participation | pos | exec | check side by side."""
+    data_specs = []
+    p_path = RESULTS_DIR / "participation.csv"
+    if p_path.exists():
+        df = pd.read_csv(p_path)
+        if "n_presses" in df.columns:
+            df = df.rename(columns={"n_presses": "n_press"})
+        if "total" in df.columns:
+            data_specs.append(("participation", df["total"].dropna(), "total"))
+    m_path = RESULTS_DIR / "modeling.csv"
+    if m_path.exists():
+        m = pd.read_csv(m_path)
+        if "pos_total" in m.columns:
+            data_specs.append(("pos", m["pos_total"].dropna(), "pos_total"))
+        if "exec_total" in m.columns:
+            data_specs.append(("exec", m["exec_total"].dropna(), "exec_total"))
+        if "check_total" in m.columns:
+            data_specs.append(("check", m["check_total"].dropna(), "check_total"))
+    if not data_specs:
+        print("contribution_distributions: need participation.csv and/or modeling.csv")
         return
 
     PLOTS_DIR.mkdir(parents=True, exist_ok=True)
-    fig, axes = plt.subplots(1, len(cols), figsize=(4 * len(cols), 4))
-    if len(cols) == 1:
+    n = len(data_specs)
+    fig, axes = plt.subplots(1, n, figsize=(4 * n, 4))
+    if n == 1:
         axes = [axes]
-
-    for ax, col in zip(axes, cols):
-        s = m[col].dropna()
+    for ax, (label, s, _) in zip(axes, data_specs):
         ax.hist(s, bins=50, edgecolor="white", linewidth=0.5)
         ax.axvline(0, color="black", linestyle="--", alpha=0.7)
-        ax.set_title(col)
+        ax.set_title(label)
         ax.set_xlabel("value")
-
     plt.suptitle("Contribution distributions (player-level)")
     plt.tight_layout()
     out = PLOTS_DIR / "contribution_distributions.png"
@@ -594,6 +603,99 @@ def ranking_comparison_scatter() -> None:
         print(f"Saved: {out}")
 
 
+def team_level_check_ability() -> None:
+    """Side-by-side bar charts of team-level total forecheck ability (check, participation, distance)."""
+    s_path = DATA_DIR / "stints.parquet"
+    fc_path = PROCESSED_DIR / "forechecks.parquet"
+    paths = {
+        "check": (RESULTS_DIR / "modeling.csv", "check_total"),
+        "participation": (RESULTS_DIR / "participation.csv", "total"),
+        "distance": (RESULTS_DIR / "distance.csv", "total"),
+    }
+    if not s_path.exists():
+        print("team_level_check_ability: need stints.parquet")
+        return
+
+    stints = pd.read_parquet(s_path)[["player_id", "team_id", "team"]].drop_duplicates()
+
+    dfs = {}
+    for name, (p, total_col) in paths.items():
+        if not p.exists():
+            continue
+        df = pd.read_csv(p)
+        if total_col not in df.columns:
+            continue
+        merged = stints.merge(df[["player_id", total_col]], on="player_id", how="inner")
+        agg = merged.groupby(["team_id", "team"])[total_col].sum().reset_index()
+        agg = agg.rename(columns={total_col: name})
+        dfs[name] = agg
+
+    if not dfs:
+        print("team_level_check_ability: no method CSVs found")
+        return
+
+    # Merge all methods; sort by check (or first available)
+    merged = dfs[list(dfs.keys())[0]][["team_id", "team"]].copy()
+    for name in dfs:
+        merged = merged.merge(dfs[name], on=["team_id", "team"], how="outer")
+    for name in dfs:
+        merged[name] = merged[name].fillna(0)
+    sort_col = "check" if "check" in merged.columns else list(dfs.keys())[0]
+    merged = merged.sort_values(sort_col, ascending=True).reset_index(drop=True)
+
+    # Team press success rate (y = 1 when forecheck recovers puck)
+    if fc_path.exists():
+        fc = pd.read_parquet(fc_path)[["game_id", "pressing_team_id", "y"]]
+        success = fc.groupby("pressing_team_id")["y"].agg(["mean", "count"]).reset_index()
+        success = success.rename(columns={"pressing_team_id": "team_id", "mean": "success_rate"})
+        # Map team_id to team name
+        team_map = stints[["team_id", "team"]].drop_duplicates().set_index("team_id")["team"]
+        success["team"] = success["team_id"].map(team_map)
+        success = success.dropna(subset=["team"])
+        merged = merged.merge(
+            success[["team_id", "success_rate"]],
+            on="team_id",
+            how="left",
+        )
+        merged["success_rate"] = merged["success_rate"].fillna(0)
+    else:
+        merged["success_rate"] = np.nan
+
+    n_methods = len(dfs)
+    PLOTS_DIR.mkdir(parents=True, exist_ok=True)
+    fig, axes = plt.subplots(1, n_methods, figsize=(5 * n_methods, max(6, len(merged) * 0.35)), sharey=True)
+    if n_methods == 1:
+        axes = [axes]
+
+    for ax, name in zip(axes, dfs.keys()):
+        vals = merged[name].values
+        colors = ["#2ecc71" if v > 0 else "#e74c3c" if v < 0 else "#95a5a6" for v in vals]
+        bars = ax.barh(range(len(merged)), vals, color=colors)
+        ax.set_yticks(range(len(merged)))
+        ax.set_yticklabels(merged["team"].values)
+        ax.invert_yaxis()
+        ax.set_xlabel(f"Total {name} credit")
+        ax.set_title(name.capitalize())
+        ax.axvline(0, color="black", linestyle="-", linewidth=0.5)
+
+        # Success rate on top of bars
+        if "success_rate" in merged.columns and merged["success_rate"].notna().any():
+            xlim = ax.get_xlim()
+            for i, (v, r) in enumerate(zip(vals, merged["success_rate"].values)):
+                if pd.isna(r):
+                    continue
+                x_pos = v + (0.02 * (xlim[1] - xlim[0]) if v >= 0 else v - 0.02 * (xlim[1] - xlim[0]))
+                ha = "left" if v >= 0 else "right"
+                ax.text(x_pos, i, f"{100 * r:.1f}%", va="center", ha=ha, fontsize=8)
+
+    plt.suptitle("Team-level total forecheck ability")
+    plt.tight_layout()
+    out = PLOTS_DIR / "team_check_ability.png"
+    plt.savefig(out, dpi=150)
+    plt.close()
+    print(f"Saved: {out}")
+
+
 def main() -> None:
     import argparse
     parser = argparse.ArgumentParser(description="EDA visuals for forecheck analysis")
@@ -606,11 +708,12 @@ def main() -> None:
     parser.add_argument("--rankings", action="store_true", help="Top player bar charts")
     parser.add_argument("--player-press", action="store_true", help="Possession-level credit stats")
     parser.add_argument("--scatter", action="store_true", help="Modeling vs participation/distance scatter")
+    parser.add_argument("--team-check", action="store_true", help="Team-level check ability bar chart")
     args = parser.parse_args()
 
     run_all = args.all or not any([
         args.possession, args.gifs, args.slot_audit, args.spreads,
-        args.distributions, args.rankings, args.player_press, args.scatter,
+        args.distributions, args.rankings, args.player_press, args.scatter, args.team_check,
     ])
 
     if run_all or args.possession:
@@ -629,6 +732,8 @@ def main() -> None:
         player_press_distributions()
     if run_all or args.scatter:
         ranking_comparison_scatter()
+    if run_all or args.team_check:
+        team_level_check_ability()
 
 
 if __name__ == "__main__":

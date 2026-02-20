@@ -30,7 +30,9 @@ import numpy as np
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from tqdm import tqdm
 import pandas as pd
+from sklearn.calibration import CalibratedClassifierCV
 from sklearn.compose import ColumnTransformer
+from sklearn.frozen import FrozenEstimator
 from sklearn.impute import SimpleImputer
 from sklearn.metrics import log_loss
 from sklearn.model_selection import GroupShuffleSplit
@@ -158,6 +160,102 @@ def _build_model(name: str, params: dict, preprocessor: ColumnTransformer) -> Pi
         ("prep", preprocessor),
         ("model", estimator),
     ])
+
+
+def fit_hybrid(
+    train_df: pd.DataFrame,
+    numeric_cols: list[str],
+    cat_cols: list[str],
+    calibrate: bool = True,
+) -> tuple[Pipeline, Pipeline]:
+    """Fit start + hazard models. If calibrate=True, use 80% fit / 20% calibrate. Returns (start_pipe, hazard_pipe)."""
+    from _preprocess import TimeAugmenter
+
+    if calibrate:
+        splitter = GroupShuffleSplit(n_splits=1, test_size=0.2, random_state=RANDOM_STATE + 100)
+        fit_idx, cal_idx = next(splitter.split(train_df, groups=train_df["fc_sequence_id"]))
+        train_fit = train_df.iloc[fit_idx]
+        train_cal = train_df.iloc[cal_idx]
+    else:
+        train_fit = train_df
+        train_cal = None
+    _, train_fit_is_start = _compute_start_meta(train_fit)
+    if train_cal is not None:
+        _, train_cal_is_start = _compute_start_meta(train_cal)
+
+    # Start model
+    seq_outcome = train_fit.groupby("fc_sequence_id")["event_t"].max().reset_index()
+    seq_outcome["success"] = (seq_outcome["event_t"] == 1).astype(np.int32)
+    start_index, _ = _compute_start_meta(train_fit)
+    start_row_idx = start_index.values
+    start_seq_ids = train_fit.loc[start_row_idx, "fc_sequence_id"].values
+    y_train_start = seq_outcome.set_index("fc_sequence_id").loc[start_seq_ids, "success"].values
+    X_train_start = train_fit.loc[start_row_idx, numeric_cols + cat_cols]
+    preprocessor_start = build_preprocessor(numeric_cols, cat_cols)
+    preprocessor_start.fit(X_train_start)
+    start_params = load_best_start_model_from_tuning()
+    start_defaults = {
+        "n_estimators": 300, "max_depth": 6, "learning_rate": 0.05,
+        "min_child_weight": 5, "subsample": 0.8, "colsample_bytree": 0.8,
+        "reg_alpha": 0.1, "reg_lambda": 1.0,
+    }
+    if start_params:
+        start_defaults.update({k: v for k, v in start_params.items() if k in start_defaults})
+    start_xgb = xgb.XGBClassifier(
+        objective="binary:logistic",
+        random_state=RANDOM_STATE,
+        n_jobs=-1,
+        **start_defaults,
+    )
+    start_pipe = Pipeline([
+        ("time_aug", TimeAugmenter()),
+        ("prep", preprocessor_start),
+        ("model", start_xgb),
+    ])
+    start_pipe.fit(X_train_start, y_train_start)
+
+    if calibrate and train_cal is not None:
+        start_cal_idx = _compute_start_meta(train_cal)[0].values
+        X_cal_start = train_cal.loc[start_cal_idx, numeric_cols + cat_cols]
+        seq_cal = train_cal.groupby("fc_sequence_id")["event_t"].max().reset_index()
+        seq_cal["success"] = (seq_cal["event_t"] == 1).astype(np.int32)
+        y_cal_start = seq_cal.set_index("fc_sequence_id").loc[
+            train_cal.loc[start_cal_idx, "fc_sequence_id"].values, "success"
+        ].values
+        start_pipe = CalibratedClassifierCV(FrozenEstimator(start_pipe), method="isotonic", cv=5)
+        start_pipe.fit(X_cal_start, y_cal_start)
+
+    # Hazard model
+    train_fit_exec_mask = ~train_fit_is_start
+    X_train_exec = train_fit.loc[train_fit_exec_mask, numeric_cols + cat_cols]
+    y_train_exec = train_fit.loc[train_fit_exec_mask, "target_class"]
+    preprocessor_exec = build_preprocessor(numeric_cols, cat_cols)
+    preprocessor_exec.fit(X_train_exec)
+    tuning_choice = load_best_model_from_tuning()
+    if tuning_choice is None:
+        best_model_name, best_params = "xgboost", {
+            "max_depth": 6, "learning_rate": 0.05, "n_estimators": 300,
+            "min_child_weight": 5, "subsample": 0.8, "colsample_bytree": 0.8,
+            "reg_alpha": 0.1, "reg_lambda": 1.0,
+        }
+    else:
+        best_model_name, best_params = tuning_choice
+    hazard_pipe = _build_model(best_model_name, best_params, preprocessor_exec)
+    hazard_pipe.fit(X_train_exec, y_train_exec)
+
+    if calibrate and train_cal is not None:
+        train_cal_exec_mask = ~train_cal_is_start
+        X_cal_exec = train_cal.loc[train_cal_exec_mask, numeric_cols + cat_cols]
+        y_cal_exec = train_cal.loc[train_cal_exec_mask, "target_class"]
+        hazard_pipe = CalibratedClassifierCV(FrozenEstimator(hazard_pipe), method="isotonic", cv=5)
+        hazard_pipe.fit(X_cal_exec, y_cal_exec)
+
+    return start_pipe, hazard_pipe
+
+
+def fit_and_calibrate_hybrid(train_df, numeric_cols, cat_cols):
+    """Thin wrapper: always calibrate."""
+    return fit_hybrid(train_df, numeric_cols, cat_cols, calibrate=True)
 
 
 def _get_slot_cols(slot: str, df: pd.DataFrame) -> list[str]:
@@ -480,25 +578,52 @@ def build_player_press_credit(hazard_model, start_model, source_df, X_source, sl
         delta_exec[idx, :] = de
 
     # Allocate fixed totals by ghost-based shares
-    # share_s = Δ_s / ΣΔ_k (slot s's proportion of total delta)
-    # pos_credit = share × (p₀ - p̄); exec_credit = share × (outcome - p₀)
+    _eps = 1e-12
     sum_pos = np.sum(delta_pos, axis=0)
     sum_exec = np.sum(delta_exec, axis=0)
-    sum_pos = np.where(np.abs(sum_pos) < 1e-10, 1.0, sum_pos)
-    sum_exec = np.where(np.abs(sum_exec) < 1e-10, 1.0, sum_exec)
-    share_pos = delta_pos / sum_pos
-    share_exec = delta_exec / sum_exec
+    share_pos = delta_pos / (sum_pos + _eps)
+    share_exec = delta_exec / (sum_exec + _eps)
 
+    # pos_total = p₀ - p̄ ∈ [-p̄, 1-p̄] (e.g. [-0.35, 0.65] if p̄≈0.35); exec_total = outcome - p₀ ∈ [-1, 1]
     pos_total = p0 - p_bar
     exec_total = outcome - p0
     pos_credit_slot = share_pos * pos_total
     exec_credit_slot = share_exec * exec_total
 
+    # Fix 4: Reallocate empty-slot credit to filled slots (e.g. F5 in 4v4 has no player → reallocate to F1-F4)
+    stints_by_slot_seq = {}
+    for slot_idx, slot in enumerate(slot_names):
+        slot_id = f"{slot}_id"
+        stints_by_slot_seq[slot_idx] = _get_stints_per_sequence(source_df, slot_id, start_index, seq_ids_ordered)
+    has_stints = np.zeros((n_slots, n_seq), dtype=bool)
+    for slot_idx in range(n_slots):
+        stints_by_seq = stints_by_slot_seq[slot_idx]
+        for i, sid in enumerate(seq_ids_ordered):
+            stints = stints_by_seq.get(sid, [])
+            has_stints[slot_idx, i] = len(stints) > 0
+    for i in range(n_seq):
+        filled = has_stints[:, i]
+        empty = ~filled
+        if empty.any():
+            orphaned_pos = pos_credit_slot[empty, i].sum()
+            orphaned_exec = exec_credit_slot[empty, i].sum()
+            if filled.any():
+                delta_pos_filled = np.where(filled, delta_pos[:, i], 0.0)
+                delta_exec_filled = np.where(filled, delta_exec[:, i], 0.0)
+                sum_pos_f = delta_pos_filled.sum()
+                sum_exec_f = delta_exec_filled.sum()
+                share_pos_f = np.where(filled, delta_pos[:, i] / (sum_pos_f + _eps), 0.0)
+                share_exec_f = np.where(filled, delta_exec[:, i] / (sum_exec_f + _eps), 0.0)
+                pos_credit_slot[:, i] = np.where(empty, 0.0, pos_credit_slot[:, i] + share_pos_f * orphaned_pos)
+                exec_credit_slot[:, i] = np.where(empty, 0.0, exec_credit_slot[:, i] + share_exec_f * orphaned_exec)
+            else:
+                pos_credit_slot[:, i] = 0.0
+                exec_credit_slot[:, i] = 0.0
+
     # Stint attribution: positioning to start-row player; exec split by n_non_start share
     rows = []
     for slot_idx, slot in enumerate(slot_names):
-        slot_id = f"{slot}_id"
-        stints_by_seq = _get_stints_per_sequence(source_df, slot_id, start_index, seq_ids_ordered)
+        stints_by_seq = stints_by_slot_seq[slot_idx]
         for i, sid in enumerate(seq_ids_ordered):
             stints = stints_by_seq.get(sid, [])
             total_non_start = sum(s[1] for s in stints)
@@ -506,7 +631,11 @@ def build_player_press_credit(hazard_model, start_model, source_df, X_source, sl
             exec_i = exec_credit_slot[slot_idx, i]
             for player_id, n_non_start, contains_start in stints:
                 pos_credit = pos_i if contains_start else 0.0
-                exec_share = n_non_start / total_non_start if total_non_start > 0 else 0.0
+                exec_share = (
+                    n_non_start / total_non_start
+                    if total_non_start > 0
+                    else 1.0 / len(stints)  # no tracking for exec: even split among stints
+                )
                 exec_credit = exec_i * exec_share
                 total = pos_credit + exec_credit
                 if player_id is not None and (pos_credit != 0 or exec_credit != 0):
@@ -589,6 +718,7 @@ def _write_clean_csv(credit, out_path):
 def main():
     parser = argparse.ArgumentParser(description="Train hazard models and compute player credits")
     parser.add_argument("--max-rows", type=int, default=None, help="Subsample for smaller eval")
+    parser.add_argument("--no-calibrate", action="store_true", help="Skip isotonic calibration; use raw model outputs")
     args = parser.parse_args()
 
     print("[1/5] Loading data and splitting...")
@@ -606,66 +736,23 @@ def main():
     numeric_cols, cat_cols = build_feature_lists(df)
     _, train_is_start = _compute_start_meta(train_df)
 
-    # Start model: sequence-level P(success) given start config (incl. missingness indicators)
-    print("\n[2/5] Training start model (XGBoost, sequence-level success)...")
-    seq_outcome = train_df.groupby("fc_sequence_id")["event_t"].max().reset_index()
-    seq_outcome["success"] = (seq_outcome["event_t"] == 1).astype(np.int32)
-    start_index, _ = _compute_start_meta(train_df)
-    start_row_idx = start_index.values
-    start_seq_ids = train_df.loc[start_row_idx, "fc_sequence_id"].values
-    y_train_start = seq_outcome.set_index("fc_sequence_id").loc[start_seq_ids, "success"].values
-    X_train_start = train_df.loc[start_row_idx, numeric_cols + cat_cols]
-    preprocessor_start = build_preprocessor(numeric_cols, cat_cols)
-    preprocessor_start.fit(X_train_start)
-    from _preprocess import TimeAugmenter
-    start_params = load_best_start_model_from_tuning()
-    start_defaults = {
-        "n_estimators": 300, "max_depth": 6, "learning_rate": 0.05,
-        "min_child_weight": 5, "subsample": 0.8, "colsample_bytree": 0.8,
-        "reg_alpha": 0.1, "reg_lambda": 1.0,
-    }
-    if start_params:
-        start_defaults.update({k: v for k, v in start_params.items() if k in start_defaults})
-    start_xgb = xgb.XGBClassifier(
-        objective="binary:logistic",
-        random_state=RANDOM_STATE,
-        n_jobs=-1,
-        **start_defaults,
-    )
-    start_pipe = Pipeline([
-        ("time_aug", TimeAugmenter()),
-        ("prep", preprocessor_start),
-        ("model", start_xgb),
-    ])
-    start_pipe.fit(X_train_start, y_train_start)
-    start_proba = start_pipe.predict_proba(X_train_start)
-    p_success = start_proba[:, 1].mean()
-    print(f"  Start model: P(success) mean={p_success:.4f}, n_start={len(X_train_start):,}")
+    # Fit start + hazard models (optionally calibrate on held-out 20%)
+    cal_msg = " (no calibration)" if args.no_calibrate else " and calibrating"
+    print(f"\n[2/5] Training{cal_msg} start + hazard models...")
+    start_pipe, hazard_pipe = fit_hybrid(train_df, numeric_cols, cat_cols, calibrate=not args.no_calibrate)
+    start_proba = start_pipe.predict_proba(train_df.loc[_compute_start_meta(train_df)[0].values, numeric_cols + cat_cols])
+    print(f"  Start model: P(success) mean={start_proba[:, 1].mean():.4f}")
 
-    # Hazard model: exec rows only (non-start)
-    print("\n[3/5] Training hazard model (exec rows only)...")
-    train_exec_mask = ~train_is_start
-    X_train_exec = train_df.loc[train_exec_mask, numeric_cols + cat_cols]
-    y_train_exec = train_df.loc[train_exec_mask, "target_class"]
-    preprocessor_exec = build_preprocessor(numeric_cols, cat_cols)
-    preprocessor_exec.fit(X_train_exec)
-    tuning_choice = load_best_model_from_tuning()
-    if tuning_choice is None:
-        best_model_name, best_params = "xgboost", {
-            "max_depth": 6, "learning_rate": 0.05, "n_estimators": 300,
-            "min_child_weight": 5, "subsample": 0.8, "colsample_bytree": 0.8,
-            "reg_alpha": 0.1, "reg_lambda": 1.0,
-        }
-    else:
-        best_model_name, best_params = tuning_choice
-    hazard_pipe = _build_model(best_model_name, best_params, preprocessor_exec)
-    hazard_pipe.fit(X_train_exec, y_train_exec)
+    # Hazard log loss on test
+    print("\n[3/5] Evaluating hazard model...")
     _, test_is_start = _compute_start_meta(test_df)
     test_exec_mask = ~test_is_start
     X_test_exec = test_df.loc[test_exec_mask, numeric_cols + cat_cols]
     y_test_exec = test_df.loc[test_exec_mask, "target_class"]
     proba_exec = hazard_pipe.predict_proba(X_test_exec)
     ll = log_loss(y_test_exec, proba_exec, labels=[0, 1, 2])
+    tuning_choice = load_best_model_from_tuning()
+    best_model_name = tuning_choice[0] if tuning_choice else "xgboost"
     summary = pd.DataFrame([{
         "model": "hybrid",
         "start_model": "p0_xgb" if load_best_start_model_from_tuning() else "xgboost",

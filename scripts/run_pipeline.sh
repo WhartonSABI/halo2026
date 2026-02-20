@@ -32,6 +32,9 @@ echo "=== 05 Modeling ==="
 echo "=== 06 Ranking ==="
 "$PYTHON" scripts/06_ranking.py
 
+echo "=== 07 Evaluation ==="
+"$PYTHON" scripts/07_evaluation.py
+
 echo "=== Visuals ==="
 "$PYTHON" scripts/_visuals.py --all
 

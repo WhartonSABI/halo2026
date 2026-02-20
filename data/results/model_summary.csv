@@ -1,2 +1,2 @@
 model,start_model,hazard_model,hazard_log_loss
-hybrid,p0_xgb,xgboost,0.13112799183420923
+hybrid,p0_xgb,xgboost,0.13382752144963433
