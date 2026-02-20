@@ -137,7 +137,7 @@ def _build_sequence_level_controls(forechecks: pd.DataFrame, events: pd.DataFram
     ]]
 
 
-def _process_one_frame(r, frame: pd.DataFrame) -> dict | None:
+def _process_one_frame(r, frame: pd.DataFrame, skater_ids: set | None = None) -> dict | None:
     """Process a single (fc_sequence_id, sl_event_id) frame; returns feat dict or None if skip."""
     # Carrier = primary actor; puck is with them. Position from event, velocity from tracking.
     carrier_xy = (float(r.x), float(r.y)) if np.isfinite(r.x) and np.isfinite(r.y) else (0.0, 0.0)
@@ -150,6 +150,8 @@ def _process_one_frame(r, frame: pd.DataFrame) -> dict | None:
     carrier_speed = float(np.hypot(*carrier_v))
 
     forecheckers = frame[frame["team_id"] == r.pressing_team_id].copy()
+    if skater_ids is not None:
+        forecheckers = forecheckers[forecheckers["player_id"].isin(skater_ids)]
     forecheckers["dist_to_carrier"] = np.hypot(forecheckers["tracking_x"] - carrier_xy[0], forecheckers["tracking_y"] - carrier_xy[1])
     forecheckers = forecheckers.sort_values("dist_to_carrier").head(5).reset_index(drop=True)
 
@@ -289,7 +291,7 @@ def _process_one_frame(r, frame: pd.DataFrame) -> dict | None:
     return feat
 
 
-def _process_chunk(rows_chunk: pd.DataFrame, tracking_dict: dict) -> list[dict]:
+def _process_chunk(rows_chunk: pd.DataFrame, tracking_dict: dict, skater_ids: set | None = None) -> list[dict]:
     """Process a chunk of rows; tracking_dict maps (fc_sequence_id, sl_event_id) -> frame DataFrame."""
     out = []
     for r in rows_chunk.itertuples(index=False):
@@ -297,7 +299,7 @@ def _process_chunk(rows_chunk: pd.DataFrame, tracking_dict: dict) -> list[dict]:
         frame = tracking_dict.get(key)
         if frame is None:
             continue
-        feat = _process_one_frame(r, frame)
+        feat = _process_one_frame(r, frame, skater_ids)
         if feat is not None:
             out.append(feat)
     return out
@@ -313,6 +315,9 @@ def build_hazard_rows(max_frames: int | None = None, n_jobs: int = 1) -> pd.Data
     events = pd.read_parquet(RAW_DIR / "events.parquet")
     stints = pd.read_parquet(RAW_DIR / "stints.parquet")
     games = pd.read_parquet(RAW_DIR / "games.parquet")
+    players = pd.read_parquet(RAW_DIR / "players.parquet")
+    pos_col = "primary_position" if "primary_position" in players.columns else "position"
+    skater_ids = set(players.loc[~players[pos_col].isin({"G"}), "player_id"]) if pos_col in players.columns else None
 
     seq_controls = _build_sequence_level_controls(forechecks, events, stints, games)
 
@@ -357,7 +362,7 @@ def build_hazard_rows(max_frames: int | None = None, n_jobs: int = 1) -> pd.Data
     if n_rows == 0:
         out = pd.DataFrame()
     elif n_jobs == 1:
-        out_records = _process_chunk(rows, tracking_dict)
+        out_records = _process_chunk(rows, tracking_dict, skater_ids)
         out = pd.DataFrame(out_records)
     else:
         n_chunks = max(1, min(abs(n_jobs), n_rows))
@@ -366,7 +371,7 @@ def build_hazard_rows(max_frames: int | None = None, n_jobs: int = 1) -> pd.Data
         chunk_keys = [set(zip(c["fc_sequence_id"], c["sl_event_id"])) for c in chunks]
         tracking_subdicts = [{k: tracking_dict[k] for k in keys if k in tracking_dict} for keys in chunk_keys]
         results = Parallel(n_jobs=n_jobs)(
-            delayed(_process_chunk)(chunk, td) for chunk, td in zip(chunks, tracking_subdicts)
+            delayed(_process_chunk)(chunk, td, skater_ids) for chunk, td in zip(chunks, tracking_subdicts)
         )
         out_records = [r for sub in results for r in sub]
         out = pd.DataFrame(out_records)

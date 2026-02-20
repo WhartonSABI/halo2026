@@ -9,9 +9,6 @@ from __future__ import annotations
 
 import importlib.util
 import numpy as np
-import os
-import platform
-import subprocess
 import sys
 from pathlib import Path
 
@@ -118,16 +115,6 @@ def run_calibration() -> None:
     print(f"  Hazard success: pred={h_success.mean():.4f}, actual={y_success.mean():.4f}")
     print(f"  Hazard failure: pred={h_failure.mean():.4f}, actual={y_failure.mean():.4f}")
     print(f"  Log loss (exec): {log_loss(y_test_exec, proba_exec, labels=[0, 1, 2]):.4f}")
-
-    # Open calibration plots
-    paths = [path_start, path_hazard]
-    if platform.system() == "Windows":
-        for p in paths:
-            os.startfile(str(p.resolve()))
-    else:
-        cmd = "open" if platform.system() == "Darwin" else "xdg-open"
-        for p in paths:
-            subprocess.run([cmd, str(p)], check=False)
 
 
 def _participants_from_stints(forechecks, events, stints, players):

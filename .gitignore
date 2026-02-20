@@ -20,6 +20,9 @@ data/raw/tracking.parquet
 # tex files
 *.tex
 
+# writeup
+writeup/
+
 ##############
 ### PYTHON ###
 ##############

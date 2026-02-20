@@ -86,12 +86,22 @@ def main() -> None:
         if path.exists():
             src = pd.read_csv(path)
             name_col = next((c for c in src.columns if c in ("player_name", "name")), None)
+            pos_col = next((c for c in src.columns if c in ("position", "primary_position")), None)
             if name_col:
-                names = src[["player_id", name_col]].drop_duplicates()
-                merged = merged.merge(names, on="player_id", how="left")
+                cols = ["player_id", name_col]
+                if pos_col:
+                    cols.append(pos_col)
+                meta = src[cols].drop_duplicates(subset=["player_id"])
+                merged = merged.merge(meta, on="player_id", how="left")
                 if name_col != "player_name":
                     merged = merged.rename(columns={name_col: "player_name"})
+                if pos_col and pos_col != "position":
+                    merged = merged.rename(columns={pos_col: "position"})
             break
+
+    # Exclude goalkeepers from final ranking
+    if "position" in merged.columns:
+        merged = merged[merged["position"] != "G"]
 
     order = [
         "player_id", "player_name", "n_press", "n_rows",

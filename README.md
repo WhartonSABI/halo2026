@@ -16,18 +16,51 @@ pip install -r requirements.txt
 
 ## Quick start
 
-Place raw data in `data/raw/`, then run:
+Place raw data in `data/raw/`, then run the full pipeline:
+
+```bash
+# Full pipeline (01 → 07 + visuals)
+./scripts/run_full_pipeline.sh
+```
+
+Or run step-by-step:
 
 ```bash
 python scripts/01_forechecks.py
 python scripts/02_features.py
 python scripts/03_simple-attribution.py
-python scripts/04_tuning.py           # RF/HistGBM/XGBoost tuning (optional; run before modeling)
+python scripts/04_tuning.py           # optional; run before modeling for better hyperparams
 python scripts/05_modeling.py
 python scripts/06_ranking.py
+python scripts/07_evaluation.py       # calibration + benchmark
+python scripts/_visuals.py            # all plots
 ```
 
-Outputs: `data/results/ranking.csv` (composite player ranks), `participation.csv`, `distance.csv`, `modeling.csv`; `data/processed/player_press.parquet`.
+**Modeling + ranking + eval + visuals only** (if 01–03 already run):
+
+```bash
+./scripts/run_pipeline.sh
+```
+
+Quick test with subsample:
+
+```bash
+./scripts/run_pipeline.sh --quick     # 05 uses --max-rows 10000
+```
+
+**Outputs:**
+- `data/results/` — `ranking.csv`, `participation.csv`, `distance.csv`, `modeling.csv`
+- `data/processed/` — `player_press.parquet`
+- `plots/` — calibration, attribution spreads, rankings, scatter, etc.
+
+---
+
+## Full pipeline scripts
+
+| Script | Description |
+|--------|-------------|
+| `./scripts/run_full_pipeline.sh` | Run 01 → 07 + visuals. Use `--quick` for subsampled modeling (05 only). |
+| `./scripts/run_pipeline.sh` | Run 05 → 07 + visuals (skips 01–04; assumes forechecks, features, attribution exist). |
 
 ---
 
@@ -65,7 +98,13 @@ participation.csv, distance.csv                    modeling.csv (player_press.pa
        │                                                     │
        └───────────────────────────┬─────────────────────────┘
                                   ▼
-                           06_ranking ──► ranking.csv (composite_rank = mean of method ranks)
+                           06_ranking ──► ranking.csv (composite rank)
+                                  │
+                                  ▼
+                           07_evaluation ──► calibration plots, benchmark (start + hazard)
+                                  │
+                                  ▼
+                           _visuals.py ──► plots/ (possession, spreads, rankings, scatter, etc.)
 ```
 
 ---
@@ -80,10 +119,12 @@ participation.csv, distance.csv                    modeling.csv (player_press.pa
 | 4 | `04_tuning.py` | `hazard_features.parquet` | `tuning_quick.csv` or `tuning_full.csv` *(optional)* |
 | 5 | `05_modeling.py` | `hazard_features.parquet` | `modeling.csv`, `model_summary.csv`; `processed/player_press.parquet` |
 | 6 | `06_ranking.py` | participation, distance, modeling | `ranking.csv` (composite rank) |
+| 7 | `07_evaluation.py` | hazard_features, modeling | Calibration plots (`plots/`), benchmark results |
+| — | `_visuals.py` | results CSVs | `plots/` — possession, spreads, rankings, scatter, etc. |
 
 Paths are relative to `scripts/` and `data/` (`raw/`, `processed/`, `results/`). See `data_dictionary.md` for raw schema.
 
-**EDA visuals** (`_visuals.py`, outside pipeline): `python scripts/_visuals.py` with `--all` (default) or `--possession`, `--gifs`, `--slot-audit`, `--spreads`, `--distributions`, `--exec-total`, `--rankings`, `--player-press`, `--scatter`. Produces slot-change audit, attribution spreads, contribution histograms, exec_total histogram, player ranking charts, modeling-vs-other scatter, and press GIFs.
+**EDA visuals** (`_visuals.py`): `python scripts/_visuals.py` (default: all) or `--possession`, `--gifs`, `--slot-audit`, `--spreads`, `--distributions`, `--rankings`, `--player-press`, `--scatter`, `--team-check`. Produces slot-change audit, attribution spreads, contribution histograms, player ranking charts, modeling-vs-other scatter, team-level check ability, and press GIFs.
 
 ### Step summary
 
@@ -92,9 +133,11 @@ Paths are relative to `scripts/` and `data/` (`raw/`, `processed/`, `results/`).
 | 01 | Build forecheck sequences (dump-in → LPR → terminal event) |
 | 02 | Per-frame hazard features: carrier, F1..F5 positions/angles, outlets, controls |
 | 03 | Participation (equal split) + distance (1/r weighted); both terminal-moment only |
-| 04 | Tune rf, hist_gbm, xgboost; pick best by test log loss (prep fit on train) |
+| 04 | Tune rf, hist_gbm, xgboost; pick best by test log loss *(optional)* |
 | 05 | Hybrid: start model (p₀) + hazard (exec). Credit: p₀−p̄ and outcome−p₀ via ghost shares |
 | 06 | Merge ranks, output composite |
+| 07 | Calibration diagrams (start + hazard), prediction benchmark |
+| _visuals | EDA plots in `plots/` |
 
 ### Attribution methods
 
@@ -148,18 +191,21 @@ python scripts/04_tuning.py --full  # full: 50 iterations per model
 .
 ├── scripts/
 │   ├── 01_forechecks.py         # Forecheck sequences from events
-│   ├── 02_features.py          # Hazard features
+│   ├── 02_features.py           # Hazard features
 │   ├── 03_simple-attribution.py # Participation & distance attribution
 │   ├── 04_tuning.py             # RF/HistGBM/XGBoost hyperparameter tuning (optional)
 │   ├── 05_modeling.py           # Hazard models + counterfactual credit
 │   ├── 06_ranking.py            # Composite ranking
+│   ├── 07_evaluation.py         # Calibration + benchmark
+│   ├── run_full_pipeline.sh     # Run 01 → 07 + visuals
+│   ├── run_pipeline.sh          # Run 05 → 07 + visuals (assumes 01–03 done)
 │   ├── _preprocess.py           # Shared preprocessing (tuning, modeling)
-│   └── _visuals.py              # EDA visuals (outside pipeline)
+│   └── _visuals.py              # EDA visuals
 ├── data/
 │   ├── raw/                     # events, games, players, stints, tracking
 │   ├── processed/               # forechecks, hazard_features, terminal_recovery_value, player_press
 │   └── results/                 # participation, distance, modeling, ranking
-└── plots/                       # _visuals.py outputs
+└── plots/                       # Calibration, attribution spreads, rankings, etc.
 ```
 
 ---

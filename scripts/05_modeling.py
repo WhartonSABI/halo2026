@@ -440,6 +440,40 @@ def _rf_slot_replacement(X_filled, X_raw, slot, slot_predictor, is_start_row, re
     return cf, valid_mask
 
 
+# Sentinel values for missing (uninvolved) slots. Missing = player not in frame = further back.
+# Use conservative "not in the play" values to avoid inflating p₀ (RF predicted "typical close").
+UNINVOLVED_SENTINEL = {
+    "_r": 80.0,            # far from carrier (in-play typically 10–70 ft)
+    "_vr_carrier": 0.0,   # not closing
+    "_sinθ": 0.0,         # neutral direction
+    "_cosθ": 1.0,
+    "_block_severity": 0.0,
+    "_block_center_severity": 0.0,
+    "_r_nearestOpp": 80.0,
+    "_vr_nearestOpp": 0.0,
+}
+
+
+def _fill_missing_slots_with_sentinel(X: pd.DataFrame) -> pd.DataFrame:
+    """Fill missing slot features with uninvolved sentinel (far, not closing)."""
+    out = X.copy()
+    for slot in FORECHECK_SLOTS:
+        slot_cols = _get_slot_cols(slot, X)
+        if not slot_cols:
+            continue
+        is_missing = X[slot_cols].isna().any(axis=1)
+        if not is_missing.any():
+            continue
+        for col in slot_cols:
+            suffix = col.replace(slot, "")
+            val = UNINVOLVED_SENTINEL.get(suffix)
+            if val is not None:
+                out.loc[is_missing, col] = val
+            else:
+                out.loc[is_missing, col] = 0.0
+    return out
+
+
 def _fill_missing_slots_with_rf(X, slot_predictors, exclude_slot=None):
     out = X.copy()
     for slot, pred in slot_predictors.items():
@@ -495,7 +529,7 @@ def _get_stints_per_sequence(source_df, slot_id, start_index, seq_ids):
     return out
 
 
-def _credit_one_slot(slot_rank, slot, hazard_model, start_model, source_df, X_source, X_filled,
+def _credit_one_slot(slot_rank, slot, hazard_model, start_model, source_df, X_source, X_base,
                     slot_predictors, base_start_val, base_exec_cif, start_index, is_start_row,
                     start_row_idx):
     """Compute Δ_pos and Δ_exec for one slot (ghost-averaged). Deltas used later for shares."""
@@ -506,8 +540,8 @@ def _credit_one_slot(slot_rank, slot, hazard_model, start_model, source_df, X_so
     acc_delta_exec = np.zeros(len(seq_ids))
     base_exec_val = base_exec_cif["cif_success"].values - base_exec_cif["cif_failure"].values
     for _ in range(GHOST_DRAWS):
-        cf_start_features, _ = _rf_slot_replacement(X_filled, X_source, slot, pred, is_start_row, replace_start_only=True)
-        cf_full_features, _ = _rf_slot_replacement(X_filled, X_source, slot, pred, is_start_row, replace_start_only=False)
+        cf_start_features, _ = _rf_slot_replacement(X_base, X_source, slot, pred, is_start_row, replace_start_only=True)
+        cf_full_features, _ = _rf_slot_replacement(X_base, X_source, slot, pred, is_start_row, replace_start_only=False)
         X_start_cf = cf_start_features.loc[start_row_idx]
         cf_start_val = start_model.predict_proba(X_start_cf)[:, 1]
         cf_full_proba = hazard_model.predict_proba(cf_full_features)
@@ -521,16 +555,55 @@ def _credit_one_slot(slot_rank, slot, hazard_model, start_model, source_df, X_so
     return (slot, seq_ids, delta_pos, delta_exec)
 
 
+def _load_participants(source_df: pd.DataFrame) -> pd.DataFrame | None:
+    """Load pressing-team participants per sequence from forechecks+stints. Used when all slots empty."""
+    forechecks_path = PROJECT_ROOT / "data" / "processed" / "forechecks.parquet"
+    if not forechecks_path.exists():
+        return None
+    try:
+        forechecks = pd.read_parquet(forechecks_path)
+        events = pd.read_parquet(RAW_DIR / "events.parquet")
+        stints = pd.read_parquet(RAW_DIR / "stints.parquet")
+        players = pd.read_parquet(RAW_DIR / "players.parquet")
+    except Exception:
+        return None
+    pos_col = "primary_position" if "primary_position" in players.columns else "position"
+    skater_ids = set(players.loc[~players[pos_col].isin({"G"}), "player_id"]) if pos_col in players.columns else None
+    term = forechecks[["fc_sequence_id", "game_id", "sl_event_id_end", "pressing_team_id"]].merge(
+        events[["game_id", "sl_event_id", "game_stint"]].drop_duplicates(),
+        left_on=["game_id", "sl_event_id_end"], right_on=["game_id", "sl_event_id"], how="inner",
+    )[["fc_sequence_id", "game_id", "game_stint", "pressing_team_id"]]
+    merged = term.merge(
+        stints[["game_id", "game_stint", "player_id", "team_id"]].dropna(subset=["player_id"]),
+        on=["game_id", "game_stint"], how="left",
+    )
+    merged = merged[merged["team_id"] == merged["pressing_team_id"]]
+    if skater_ids is not None:
+        merged = merged[merged["player_id"].isin(skater_ids)]
+    participants = merged.groupby("fc_sequence_id")["player_id"].apply(
+        lambda x: x.dropna().unique().tolist()
+    ).reset_index().rename(columns={"player_id": "participant_ids"})
+    return participants
+
+
 def build_player_press_credit(hazard_model, start_model, source_df, X_source, slot_predictors,
-                              save_per_press_path=None):
-    """Crediting: positioning total=p₀-p̄ (allocate by ghost shares), exec total=outcome-p₀ (allocate by hazard shares)."""
-    X_filled = _fill_missing_slots_with_rf(X_source, slot_predictors) if slot_predictors else X_source
+                              save_per_press_path=None, verify_conservation: bool = True,
+                              participants: pd.DataFrame | None = None):
+    """Crediting: positioning total=p₀-p̄ (allocate by ghost shares), exec total=outcome-p₀ (allocate by hazard shares).
+
+    p₀ = start model predicted P(success) on the start row of each sequence (X_base, sentinel-filled).
+    p̄ = mean(outcome) over all sequences.
+    Slot-level credit is bounded by problem: pos_total ∈ [-p̄, 1-p̄], exec_total ∈ [-1, 1], so per-slot ≤ 1.
+    """
+    # Use sentinel for missing slots (uninvolved = far) everywhere. RF extrapolates from 5v5
+    # and artificially inflates config; missing = not in frame = further back.
+    X_base = _fill_missing_slots_with_sentinel(X_source)
     start_index, is_start_row = _compute_start_meta(source_df)
 
     # p₀, p̄, outcome per sequence
     seq_ids_ordered = source_df["fc_sequence_id"].drop_duplicates().values
     start_row_idx = start_index.values
-    X_start = X_filled.loc[start_row_idx]
+    X_start = X_base.loc[start_row_idx]
     base_start_proba = start_model.predict_proba(X_start)[:, 1]
     start_seq_ids = source_df.loc[start_row_idx, "fc_sequence_id"].values
     base_start_by_seq = pd.Series(base_start_proba, index=start_seq_ids)
@@ -540,7 +613,7 @@ def build_player_press_credit(hazard_model, start_model, source_df, X_source, sl
     outcome = (seq_outcome.reindex(seq_ids_ordered).fillna(0) == 1).astype(np.float64).values
     p_bar = float(outcome.mean())
 
-    base_proba = hazard_model.predict_proba(X_filled)
+    base_proba = hazard_model.predict_proba(X_base)
     base_exec_cif = _compute_cif_exec(base_proba, source_df, is_start_row)
     base_exec_cif = base_exec_cif.set_index("fc_sequence_id").reindex(seq_ids_ordered).fillna(0).reset_index()
     base_start_val = base_start_by_seq.reindex(seq_ids_ordered).fillna(0).values
@@ -550,7 +623,7 @@ def build_player_press_credit(hazard_model, start_model, source_df, X_source, sl
                   if f"{s}_id" in source_df.columns and slot_predictors and slot_predictors.get(s)]
     tqdm.write(f"  Crediting {len(slot_tasks)} slots (p₀-p̄ positioning, outcome-p₀ exec, ghost shares)...")
     task_args = [
-        (r, s, hazard_model, start_model, source_df, X_source, X_filled,
+        (r, s, hazard_model, start_model, source_df, X_source, X_base,
          slot_predictors, base_start_val, base_exec_cif, start_index, is_start_row,
          start_row_idx_ordered)
         for r, s in slot_tasks
@@ -577,18 +650,49 @@ def build_player_press_credit(hazard_model, start_model, source_df, X_source, sl
         delta_pos[idx, :] = dp
         delta_exec[idx, :] = de
 
-    # Allocate fixed totals by ghost-based shares
+    # Allocate fixed totals by ghost-based shares. Symmetric: positive total → overperformers;
+    # negative total → underperformers. Other slots get 0.
     _eps = 1e-12
-    sum_pos = np.sum(delta_pos, axis=0)
-    sum_exec = np.sum(delta_exec, axis=0)
-    share_pos = delta_pos / (sum_pos + _eps)
-    share_exec = delta_exec / (sum_exec + _eps)
-
-    # pos_total = p₀ - p̄ ∈ [-p̄, 1-p̄] (e.g. [-0.35, 0.65] if p̄≈0.35); exec_total = outcome - p₀ ∈ [-1, 1]
     pos_total = p0 - p_bar
     exec_total = outcome - p0
+    over_pos = np.maximum(delta_pos, 0.0)
+    under_pos = np.maximum(-delta_pos, 0.0)
+    over_exec = np.maximum(delta_exec, 0.0)
+    under_exec = np.maximum(-delta_exec, 0.0)
+    sum_over_pos = np.sum(over_pos, axis=0)
+    sum_under_pos = np.sum(under_pos, axis=0)
+    sum_over_exec = np.sum(over_exec, axis=0)
+    sum_under_exec = np.sum(under_exec, axis=0)
+    # Positive total: weight overperformers. Negative total: weight underperformers.
+    share_pos = np.where(
+        pos_total >= 0,
+        np.where(sum_over_pos >= _eps, over_pos / (sum_over_pos + _eps), 1.0 / n_slots),
+        np.where(sum_under_pos >= _eps, under_pos / (sum_under_pos + _eps), 1.0 / n_slots),
+    )
+    share_exec = np.where(
+        exec_total >= 0,
+        np.where(sum_over_exec >= _eps, over_exec / (sum_over_exec + _eps), 1.0 / n_slots),
+        np.where(sum_under_exec >= _eps, under_exec / (sum_under_exec + _eps), 1.0 / n_slots),
+    )
+
+    # pos_total = p₀ - p̄ ∈ [-p̄, 1-p̄]; exec_total = outcome - p₀ ∈ [-1, 1]
     pos_credit_slot = share_pos * pos_total
     exec_credit_slot = share_exec * exec_total
+
+    seq_pos_sum = pos_total.sum()
+    seq_exec_sum = exec_total.sum()
+    # Conservation check 0: slot sums before realloc should match seq-level
+    if verify_conservation:
+        pre_pos = pos_credit_slot.sum()
+        pre_exec = exec_credit_slot.sum()
+        tqdm.write(f"  [verify] pre-realloc slot sums: pos={pre_pos:.6f} (expect {seq_pos_sum:.6f}), exec={pre_exec:.6f} (expect {seq_exec_sum:.6f})")
+
+    # Conservation check 1: sequence-level totals (pos+exec = outcome-p̄, sum ≈ 0)
+    if verify_conservation:
+        seq_check = (pos_total + exec_total).sum()
+        tqdm.write(f"  [verify] seq-level: sum(pos)={seq_pos_sum:.6f}, sum(exec)={seq_exec_sum:.6f}, sum(pos+exec)={seq_check:.6f} (should=0)")
+        if abs(seq_check) > 1e-4:
+            tqdm.write(f"  [verify] WARNING: pos+exec should sum to 0, got {seq_check:.6f}")
 
     # Fix 4: Reallocate empty-slot credit to filled slots (e.g. F5 in 4v4 has no player → reallocate to F1-F4)
     stints_by_slot_seq = {}
@@ -601,6 +705,9 @@ def build_player_press_credit(hazard_model, start_model, source_df, X_source, sl
         for i, sid in enumerate(seq_ids_ordered):
             stints = stints_by_seq.get(sid, [])
             has_stints[slot_idx, i] = len(stints) > 0
+    n_all_empty = 0
+    dropped_pos, dropped_exec = 0.0, 0.0
+    participant_rows: list[dict] = []
     for i in range(n_seq):
         filled = has_stints[:, i]
         empty = ~filled
@@ -608,19 +715,66 @@ def build_player_press_credit(hazard_model, start_model, source_df, X_source, sl
             orphaned_pos = pos_credit_slot[empty, i].sum()
             orphaned_exec = exec_credit_slot[empty, i].sum()
             if filled.any():
-                delta_pos_filled = np.where(filled, delta_pos[:, i], 0.0)
-                delta_exec_filled = np.where(filled, delta_exec[:, i], 0.0)
-                sum_pos_f = delta_pos_filled.sum()
-                sum_exec_f = delta_exec_filled.sum()
-                share_pos_f = np.where(filled, delta_pos[:, i] / (sum_pos_f + _eps), 0.0)
-                share_exec_f = np.where(filled, delta_exec[:, i] / (sum_exec_f + _eps), 0.0)
+                n_filled = filled.sum()
+                over_pos_f = np.where(filled, np.maximum(delta_pos[:, i], 0.0), 0.0)
+                under_pos_f = np.where(filled, np.maximum(-delta_pos[:, i], 0.0), 0.0)
+                over_exec_f = np.where(filled, np.maximum(delta_exec[:, i], 0.0), 0.0)
+                under_exec_f = np.where(filled, np.maximum(-delta_exec[:, i], 0.0), 0.0)
+                sum_over_pos_f = over_pos_f.sum()
+                sum_under_pos_f = under_pos_f.sum()
+                sum_over_exec_f = over_exec_f.sum()
+                sum_under_exec_f = under_exec_f.sum()
+                share_pos_f = np.where(
+                    orphaned_pos >= 0,
+                    np.where(sum_over_pos_f >= _eps, over_pos_f / (sum_over_pos_f + _eps), 1.0 / n_filled),
+                    np.where(sum_under_pos_f >= _eps, under_pos_f / (sum_under_pos_f + _eps), 1.0 / n_filled),
+                )
+                share_pos_f = np.where(filled, share_pos_f, 0.0)
+                share_exec_f = np.where(
+                    orphaned_exec >= 0,
+                    np.where(sum_over_exec_f >= _eps, over_exec_f / (sum_over_exec_f + _eps), 1.0 / n_filled),
+                    np.where(sum_under_exec_f >= _eps, under_exec_f / (sum_under_exec_f + _eps), 1.0 / n_filled),
+                )
+                share_exec_f = np.where(filled, share_exec_f, 0.0)
                 pos_credit_slot[:, i] = np.where(empty, 0.0, pos_credit_slot[:, i] + share_pos_f * orphaned_pos)
                 exec_credit_slot[:, i] = np.where(empty, 0.0, exec_credit_slot[:, i] + share_exec_f * orphaned_exec)
             else:
+                # All slots empty: split pos+exec evenly among participants if available
+                sid = seq_ids_ordered[i]
+                pids: list = []
+                if participants is not None:
+                    match = participants[participants["fc_sequence_id"] == sid]
+                    if not match.empty and isinstance(match.iloc[0]["participant_ids"], list):
+                        pids = [x for x in match.iloc[0]["participant_ids"] if x is not None]
+                if pids:
+                    n_players = len(pids)
+                    for pid in pids:
+                        participant_rows.append({
+                            "player_id": pid, "fc_sequence_id": sid, "slot": "_participants",
+                            "start_positioning_credit": orphaned_pos / n_players,
+                            "execution_credit": orphaned_exec / n_players,
+                            "total_press_credit": (orphaned_pos + orphaned_exec) / n_players,
+                        })
+                else:
+                    n_all_empty += 1
+                    dropped_pos += orphaned_pos
+                    dropped_exec += orphaned_exec
                 pos_credit_slot[:, i] = 0.0
                 exec_credit_slot[:, i] = 0.0
+    if n_all_empty > 0 and verify_conservation:
+        tqdm.write(f"  [verify] all-empty sequences: {n_all_empty}, dropped pos={dropped_pos:.6f}, exec={dropped_exec:.6f}")
+
+    # Conservation check 2: after reallocation, slot + participant should match seq totals
+    if verify_conservation:
+        slot_pos_sum = pos_credit_slot.sum()
+        slot_exec_sum = exec_credit_slot.sum()
+        part_pos = sum(r["start_positioning_credit"] for r in participant_rows)
+        part_exec = sum(r["execution_credit"] for r in participant_rows)
+        tqdm.write(f"  [verify] after realloc: slot_pos={slot_pos_sum:.6f}, slot_exec={slot_exec_sum:.6f}, participant_pos={part_pos:.6f}, participant_exec={part_exec:.6f}")
+        tqdm.write(f"  [verify] after realloc TOTAL: pos={slot_pos_sum + part_pos:.6f} (expect {seq_pos_sum:.6f}), exec={slot_exec_sum + part_exec:.6f} (expect {seq_exec_sum:.6f})")
 
     # Stint attribution: positioning to start-row player; exec split by n_non_start share
+    # Give pos to exactly one stint per (slot, seq) for conservation. Prefer start-frame stint; else first.
     rows = []
     for slot_idx, slot in enumerate(slot_names):
         stints_by_seq = stints_by_slot_seq[slot_idx]
@@ -629,8 +783,9 @@ def build_player_press_credit(hazard_model, start_model, source_df, X_source, sl
             total_non_start = sum(s[1] for s in stints)
             pos_i = pos_credit_slot[slot_idx, i]
             exec_i = exec_credit_slot[slot_idx, i]
-            for player_id, n_non_start, contains_start in stints:
-                pos_credit = pos_i if contains_start else 0.0
+            pos_recipient_idx = next((j for j, s in enumerate(stints) if s[2]), 0)  # contains_start else first
+            for j, (player_id, n_non_start, contains_start) in enumerate(stints):
+                pos_credit = pos_i if j == pos_recipient_idx else 0.0
                 exec_share = (
                     n_non_start / total_non_start
                     if total_non_start > 0
@@ -643,11 +798,14 @@ def build_player_press_credit(hazard_model, start_model, source_df, X_source, sl
                         "player_id": player_id, "fc_sequence_id": sid, "slot": slot,
                         "start_positioning_credit": pos_credit, "execution_credit": exec_credit, "total_press_credit": total,
                     })
+    rows.extend(participant_rows)
     if not rows:
         return pd.DataFrame(columns=["player_id", "n_rows", "n_press", "positioning", "execution", "total", "total_per_press"])
     per_slot = pd.DataFrame(rows)
-    for col in ["start_positioning_credit", "execution_credit", "total_press_credit"]:
-        per_slot[col] = per_slot[col].clip(lower=-1.0, upper=1.0)
+    if verify_conservation and len(per_slot) > 0:
+        pos_after = per_slot["start_positioning_credit"].sum()
+        exec_after = per_slot["execution_credit"].sum()
+        tqdm.write(f"  [verify] after stint: sum(pos)={pos_after:.6f}, sum(exec)={exec_after:.6f}")
     if len(per_slot) > 0:
         exec_per_slot = per_slot.groupby(["fc_sequence_id", "slot"], as_index=False).agg(
             exec=("execution_credit", "sum"),
@@ -694,6 +852,11 @@ def build_player_press_credit(hazard_model, start_model, source_df, X_source, sl
     summary["execution"] = summary["execution"].fillna(0)
     summary["check_total"] = summary["positioning"] + summary["execution"]
     summary["check_per_press"] = np.where(summary["n_press"] > 0, summary["check_total"] / summary["n_press"], np.nan)
+    if verify_conservation and len(summary) > 0:
+        final_pos = summary["positioning"].sum()
+        final_exec = summary["execution"].sum()
+        final_check = summary["check_total"].sum()
+        tqdm.write(f"  [verify] final player sums: pos={final_pos:.6f}, exec={final_exec:.6f}, check={final_check:.6f}")
     return summary.sort_values("check_per_press", ascending=False).reset_index(drop=True)
 
 
@@ -712,7 +875,11 @@ def _write_clean_csv(credit, out_path):
         on="player_id", how="left",
     )
     out_cols = ["player_id", "player_name", "position", "n_press", "n_rows", "pos_total", "exec_total", "check_total", "check_per_press"]
-    out[[c for c in out_cols if c in out.columns]].to_csv(out_path, index=False)
+    out = out[[c for c in out_cols if c in out.columns]].copy()
+    # Exclude goalkeepers
+    if "position" in out.columns:
+        out = out[out["position"] != "G"]
+    out.to_csv(out_path, index=False)
 
 
 def main():
@@ -772,9 +939,13 @@ def main():
 
     print("\n[5/5] Computing player credits (hybrid: start + hazard exec)...")
     X_all = df[numeric_cols + cat_cols]
+    participants = _load_participants(df)
+    if participants is not None:
+        tqdm.write(f"  Loaded participants for {len(participants):,} sequences (fallback when all slots empty)")
     player_credit = build_player_press_credit(
         hazard_pipe, start_pipe, df, X_all, slot_predictors,
         save_per_press_path=OUT_DIR / "player_press.parquet",
+        participants=participants,
     )
     _write_clean_csv(player_credit, RESULTS_DIR / "modeling.csv")
     print("\nDone.")

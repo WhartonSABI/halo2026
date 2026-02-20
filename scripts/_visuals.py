@@ -769,17 +769,14 @@ def plot_start_frame_positioning(seq_id: int) -> None:
     print(f"Saved: {out}")
 
 
-def team_level_check_ability() -> None:
-    """Side-by-side bar charts of team-level total forecheck ability (check, participation, distance)."""
+def team_level_check() -> None:
+    """Bar chart of team-level total check (modeling only)."""
     s_path = DATA_DIR / "stints.parquet"
-    fc_path = PROCESSED_DIR / "forechecks.parquet"
     paths = {
         "check": (RESULTS_DIR / "modeling.csv", "check_total"),
-        "participation": (RESULTS_DIR / "participation.csv", "total"),
-        "distance": (RESULTS_DIR / "distance.csv", "total"),
     }
     if not s_path.exists():
-        print("team_level_check_ability: need stints.parquet")
+        print("team_level_check: need stints.parquet")
         return
 
     stints = pd.read_parquet(s_path)[["player_id", "team_id", "team"]].drop_duplicates()
@@ -797,7 +794,7 @@ def team_level_check_ability() -> None:
         dfs[name] = agg
 
     if not dfs:
-        print("team_level_check_ability: no method CSVs found")
+        print("team_level_check: no method CSVs found")
         return
 
     # Merge all methods; sort by check (or first available)
@@ -808,24 +805,6 @@ def team_level_check_ability() -> None:
         merged[name] = merged[name].fillna(0)
     sort_col = "check" if "check" in merged.columns else list(dfs.keys())[0]
     merged = merged.sort_values(sort_col, ascending=True).reset_index(drop=True)
-
-    # Team press success rate (y = 1 when forecheck recovers puck)
-    if fc_path.exists():
-        fc = pd.read_parquet(fc_path)[["game_id", "pressing_team_id", "y"]]
-        success = fc.groupby("pressing_team_id")["y"].agg(["mean", "count"]).reset_index()
-        success = success.rename(columns={"pressing_team_id": "team_id", "mean": "success_rate"})
-        # Map team_id to team name
-        team_map = stints[["team_id", "team"]].drop_duplicates().set_index("team_id")["team"]
-        success["team"] = success["team_id"].map(team_map)
-        success = success.dropna(subset=["team"])
-        merged = merged.merge(
-            success[["team_id", "success_rate"]],
-            on="team_id",
-            how="left",
-        )
-        merged["success_rate"] = merged["success_rate"].fillna(0)
-    else:
-        merged["success_rate"] = np.nan
 
     n_methods = len(dfs)
     PLOTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -840,23 +819,12 @@ def team_level_check_ability() -> None:
         ax.set_yticks(range(len(merged)))
         ax.set_yticklabels(merged["team"].values)
         ax.invert_yaxis()
-        ax.set_xlabel(f"Total {name} credit")
-        ax.set_title(name.capitalize())
+        ax.set_xlabel("Total check")
         ax.axvline(0, color="black", linestyle="-", linewidth=0.5)
 
-        # Success rate on top of bars
-        if "success_rate" in merged.columns and merged["success_rate"].notna().any():
-            xlim = ax.get_xlim()
-            for i, (v, r) in enumerate(zip(vals, merged["success_rate"].values)):
-                if pd.isna(r):
-                    continue
-                x_pos = v + (0.02 * (xlim[1] - xlim[0]) if v >= 0 else v - 0.02 * (xlim[1] - xlim[0]))
-                ha = "left" if v >= 0 else "right"
-                ax.text(x_pos, i, f"{100 * r:.1f}%", va="center", ha=ha, fontsize=8)
-
-    plt.suptitle("Team-level total forecheck ability")
+    plt.suptitle("Team check")
     plt.tight_layout()
-    out = PLOTS_DIR / "team_check_ability.png"
+    out = PLOTS_DIR / "team_check.png"
     plt.savefig(out, dpi=150)
     plt.close()
     print(f"Saved: {out}")
@@ -874,7 +842,7 @@ def main() -> None:
     parser.add_argument("--rankings", action="store_true", help="Top player bar charts")
     parser.add_argument("--player-press", action="store_true", help="Possession-level credit stats")
     parser.add_argument("--scatter", action="store_true", help="Modeling vs participation/distance scatter")
-    parser.add_argument("--team-check", action="store_true", help="Team-level check ability bar chart")
+    parser.add_argument("--team-check", action="store_true", help="Team-level check bar chart")
     args = parser.parse_args()
 
     run_all = args.all or not any([
@@ -899,7 +867,7 @@ def main() -> None:
     if run_all or args.scatter:
         ranking_comparison_scatter()
     if run_all or args.team_check:
-        team_level_check_ability()
+        team_level_check()
 
 
 if __name__ == "__main__":

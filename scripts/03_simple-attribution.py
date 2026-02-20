@@ -139,6 +139,7 @@ def _fallback_distance_ft(manpower_state) -> float:
 def _build_distance_weights_with_unseen(
     terminal: pd.DataFrame,
     participants: pd.DataFrame,
+    skater_ids: set | None = None,
     eps: float = 1e-3,
 ) -> list[tuple[pd.Series, dict]]:
     """Build distance-weighted shares per row. F1..F5 use 1/r; unseen participants use 1/max(puck_to_center, furthest_observed)."""
@@ -156,12 +157,12 @@ def _build_distance_weights_with_unseen(
         weights: dict = {}
         observed_distances = []
 
-        # F1..F5: weight by inverse distance to carrier
+        # F1..F5: weight by inverse distance to carrier (exclude goalies)
         for i in range(1, 6):
             sid = f"F{i}_id"
             rcol = f"F{i}_r"
             pid = r[sid]
-            if pd.notna(pid):
+            if pd.notna(pid) and (skater_ids is None or pid in skater_ids):
                 dist = float(r[rcol]) if pd.notna(r[rcol]) else np.nan
                 if np.isfinite(dist):
                     observed_distances.append(dist)
@@ -229,10 +230,11 @@ def allocate_participation_from_participants(terminal: pd.DataFrame) -> pd.DataF
 def allocate_distance(
     terminal: pd.DataFrame,
     participants: pd.DataFrame,
+    skater_ids: set | None = None,
     eps: float = 1e-3,
 ) -> pd.DataFrame:
     """Distance-weighted allocation at terminal moment. F1..F5 use 1/r; unseen use fallback. No decomposition."""
-    weight_rows = _build_distance_weights_with_unseen(terminal, participants, eps=eps)
+    weight_rows = _build_distance_weights_with_unseen(terminal, participants, skater_ids=skater_ids, eps=eps)
 
     rows = []
     for r, shares in weight_rows:
@@ -311,9 +313,11 @@ def main() -> None:
         stints = pd.read_parquet(RAW_DIR / "stints.parquet")
         players = pd.read_parquet(RAW_DIR / "players.parquet")
         participants = _participants_from_stints(forechecks, events, stints, players)
+        pos_col = "primary_position" if "primary_position" in players.columns else "position"
+        skater_ids = set(players.loc[~players[pos_col].isin({"G"}), "player_id"]) if pos_col in players.columns else None
 
         terminal_hazard = build_terminal_table_from_hazard()
-        distance = allocate_distance(terminal_hazard, participants)
+        distance = allocate_distance(terminal_hazard, participants, skater_ids=skater_ids)
         terminal_path = OUT_DIR / "terminal_recovery_value.parquet"
         terminal_hazard.to_parquet(terminal_path, index=False)
         dist_path = RESULTS_DIR / "distance.csv"
