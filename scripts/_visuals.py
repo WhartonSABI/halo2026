@@ -421,44 +421,33 @@ def attribution_spreads() -> None:
 
 
 def contribution_distributions() -> None:
-    """Histograms: participation | pos | exec | check side by side."""
+    """Histograms: save Positioning, Execution, PRESS as separate PNGs for stacking in LaTeX."""
     data_specs = []
-    p_path = RESULTS_DIR / "participation.csv"
-    if p_path.exists():
-        df = pd.read_csv(p_path)
-        if "n_presses" in df.columns:
-            df = df.rename(columns={"n_presses": "n_press"})
-        if "total" in df.columns:
-            data_specs.append(("participation", df["total"].dropna(), "total"))
     m_path = RESULTS_DIR / "modeling.csv"
     if m_path.exists():
         m = pd.read_csv(m_path)
         if "pos_total" in m.columns:
-            data_specs.append(("pos", m["pos_total"].dropna(), "pos_total"))
+            data_specs.append(("Positioning", m["pos_total"].dropna(), "contrib_positioning.png"))
         if "exec_total" in m.columns:
-            data_specs.append(("exec", m["exec_total"].dropna(), "exec_total"))
+            data_specs.append(("Execution", m["exec_total"].dropna(), "contrib_execution.png"))
         if "check_total" in m.columns:
-            data_specs.append(("check", m["check_total"].dropna(), "check_total"))
+            data_specs.append(("PRESS", m["check_total"].dropna(), "contrib_press.png"))
     if not data_specs:
-        print("contribution_distributions: need participation.csv and/or modeling.csv")
+        print("contribution_distributions: need modeling.csv")
         return
 
     PLOTS_DIR.mkdir(parents=True, exist_ok=True)
-    n = len(data_specs)
-    fig, axes = plt.subplots(1, n, figsize=(4 * n, 4))
-    if n == 1:
-        axes = [axes]
-    for ax, (label, s, _) in zip(axes, data_specs):
+    for label, s, fname in data_specs:
+        fig, ax = plt.subplots(figsize=(6, 3))
         ax.hist(s, bins=50, edgecolor="white", linewidth=0.5)
         ax.axvline(0, color="black", linestyle="--", alpha=0.7)
         ax.set_title(label)
         ax.set_xlabel("value")
-    plt.suptitle("Contribution distributions (player-level)")
-    plt.tight_layout()
-    out = PLOTS_DIR / "contribution_distributions.png"
-    plt.savefig(out, dpi=150)
-    plt.close()
-    print(f"Saved: {out}")
+        plt.tight_layout()
+        out = PLOTS_DIR / fname
+        plt.savefig(out, dpi=150)
+        plt.close()
+        print(f"Saved: {out}")
 
 
 def player_rankings_visual(top_n: int = 20) -> None:
@@ -466,7 +455,7 @@ def player_rankings_visual(top_n: int = 20) -> None:
     paths = {
         "participation": (RESULTS_DIR / "participation.csv", "total"),
         "distance": (RESULTS_DIR / "distance.csv", "total"),
-        "modeling": (RESULTS_DIR / "modeling.csv", "check_total"),
+        "PRESS": (RESULTS_DIR / "modeling.csv", "check_total"),
     }
     dfs = {}
     for name, (p, total_col) in paths.items():
@@ -474,7 +463,7 @@ def player_rankings_visual(top_n: int = 20) -> None:
             df = pd.read_csv(p)
             if "n_presses" in df.columns and "n_press" not in df.columns:
                 df = df.rename(columns={"n_presses": "n_press"})
-            if total_col not in df.columns and name == "modeling":
+            if total_col not in df.columns and name == "PRESS":
                 total_col = "total"
             if total_col in df.columns and "player_name" in df.columns:
                 dfs[name] = df.nlargest(top_n, total_col)[["player_name", total_col]]
@@ -769,14 +758,14 @@ def plot_start_frame_positioning(seq_id: int) -> None:
     print(f"Saved: {out}")
 
 
-def team_level_check() -> None:
-    """Bar chart of team-level total check (modeling only)."""
+def team_level_press() -> None:
+    """Bar chart of team-level total PRESS (modeling only)."""
     s_path = DATA_DIR / "stints.parquet"
     paths = {
-        "check": (RESULTS_DIR / "modeling.csv", "check_total"),
+        "press": (RESULTS_DIR / "modeling.csv", "check_total"),
     }
     if not s_path.exists():
-        print("team_level_check: need stints.parquet")
+        print("team_level_press: need stints.parquet")
         return
 
     stints = pd.read_parquet(s_path)[["player_id", "team_id", "team"]].drop_duplicates()
@@ -794,16 +783,16 @@ def team_level_check() -> None:
         dfs[name] = agg
 
     if not dfs:
-        print("team_level_check: no method CSVs found")
+        print("team_level_press: no method CSVs found")
         return
 
-    # Merge all methods; sort by check (or first available)
+    # Merge all methods; sort by press (or first available)
     merged = dfs[list(dfs.keys())[0]][["team_id", "team"]].copy()
     for name in dfs:
         merged = merged.merge(dfs[name], on=["team_id", "team"], how="outer")
     for name in dfs:
         merged[name] = merged[name].fillna(0)
-    sort_col = "check" if "check" in merged.columns else list(dfs.keys())[0]
+    sort_col = "press" if "press" in merged.columns else list(dfs.keys())[0]
     merged = merged.sort_values(sort_col, ascending=True).reset_index(drop=True)
 
     n_methods = len(dfs)
@@ -819,12 +808,12 @@ def team_level_check() -> None:
         ax.set_yticks(range(len(merged)))
         ax.set_yticklabels(merged["team"].values)
         ax.invert_yaxis()
-        ax.set_xlabel("Total check")
+        ax.set_xlabel("Total PRESS")
         ax.axvline(0, color="black", linestyle="-", linewidth=0.5)
 
-    plt.suptitle("Team check")
+    plt.suptitle("Team PRESS")
     plt.tight_layout()
-    out = PLOTS_DIR / "team_check.png"
+    out = PLOTS_DIR / "team_press.png"
     plt.savefig(out, dpi=150)
     plt.close()
     print(f"Saved: {out}")
@@ -842,12 +831,12 @@ def main() -> None:
     parser.add_argument("--rankings", action="store_true", help="Top player bar charts")
     parser.add_argument("--player-press", action="store_true", help="Possession-level credit stats")
     parser.add_argument("--scatter", action="store_true", help="Modeling vs participation/distance scatter")
-    parser.add_argument("--team-check", action="store_true", help="Team-level check bar chart")
+    parser.add_argument("--team-press", action="store_true", help="Team-level PRESS bar chart")
     args = parser.parse_args()
 
     run_all = args.all or not any([
         args.possession, args.gifs, args.slot_audit, args.spreads,
-        args.distributions, args.rankings, args.player_press, args.scatter, args.team_check,
+        args.distributions, args.rankings, args.player_press, args.scatter, args.team_press,
     ])
 
     if run_all or args.possession:
@@ -866,8 +855,8 @@ def main() -> None:
         player_press_distributions()
     if run_all or args.scatter:
         ranking_comparison_scatter()
-    if run_all or args.team_check:
-        team_level_check()
+    if run_all or args.team_press:
+        team_level_press()
 
 
 if __name__ == "__main__":
