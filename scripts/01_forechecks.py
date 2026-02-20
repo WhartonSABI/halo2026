@@ -109,7 +109,7 @@ def build_forecheck_sequences(events: pd.DataFrame) -> pd.DataFrame:
     terminal = scan[scan["is_terminal"]].copy()
     first_term = terminal.loc[terminal.groupby(["game_id", "sequence_id", "sl_event_id_dumpin"])["sl_event_id"].idxmin()].copy()
 
-    # Compute terminal booleans on first_term (avoids index alignment after merges)
+    # Compute terminal booleans on first_term to avoid index misalignment after merges
     is_stoppage_ft = first_term["event_type"].isin(STOPPAGE)
     x_ft = first_term["x"].astype(float)
     sn_ft = first_term["sign_negative"]

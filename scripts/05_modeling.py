@@ -440,8 +440,8 @@ def _rf_slot_replacement(X_filled, X_raw, slot, slot_predictor, is_start_row, re
     return cf, valid_mask
 
 
-# Sentinel values for missing (uninvolved) slots. Missing = player not in frame = further back.
-# Use conservative "not in the play" values to avoid inflating p₀ (RF predicted "typical close").
+# Sentinel values for uninvolved slots (player not in frame = further back).
+# Conservative values avoid inflating p₀ when RF extrapolates from 5v5.
 UNINVOLVED_SENTINEL = {
     "_r": 80.0,            # far from carrier (in-play typically 10–70 ft)
     "_vr_carrier": 0.0,   # not closing
@@ -595,8 +595,6 @@ def build_player_press_credit(hazard_model, start_model, source_df, X_source, sl
     p̄ = mean(outcome) over all sequences.
     Slot-level credit is bounded by problem: pos_total ∈ [-p̄, 1-p̄], exec_total ∈ [-1, 1], so per-slot ≤ 1.
     """
-    # Use sentinel for missing slots (uninvolved = far) everywhere. RF extrapolates from 5v5
-    # and artificially inflates config; missing = not in frame = further back.
     X_base = _fill_missing_slots_with_sentinel(X_source)
     start_index, is_start_row = _compute_start_meta(source_df)
 
@@ -681,20 +679,18 @@ def build_player_press_credit(hazard_model, start_model, source_df, X_source, sl
 
     seq_pos_sum = pos_total.sum()
     seq_exec_sum = exec_total.sum()
-    # Conservation check 0: slot sums before realloc should match seq-level
     if verify_conservation:
         pre_pos = pos_credit_slot.sum()
         pre_exec = exec_credit_slot.sum()
         tqdm.write(f"  [verify] pre-realloc slot sums: pos={pre_pos:.6f} (expect {seq_pos_sum:.6f}), exec={pre_exec:.6f} (expect {seq_exec_sum:.6f})")
 
-    # Conservation check 1: sequence-level totals (pos+exec = outcome-p̄, sum ≈ 0)
     if verify_conservation:
         seq_check = (pos_total + exec_total).sum()
         tqdm.write(f"  [verify] seq-level: sum(pos)={seq_pos_sum:.6f}, sum(exec)={seq_exec_sum:.6f}, sum(pos+exec)={seq_check:.6f} (should=0)")
         if abs(seq_check) > 1e-4:
             tqdm.write(f"  [verify] WARNING: pos+exec should sum to 0, got {seq_check:.6f}")
 
-    # Fix 4: Reallocate empty-slot credit to filled slots (e.g. F5 in 4v4 has no player → reallocate to F1-F4)
+    # Reallocate empty-slot credit to filled slots (e.g. F5 in 4v4 has no player → F1-F4)
     stints_by_slot_seq = {}
     for slot_idx, slot in enumerate(slot_names):
         slot_id = f"{slot}_id"
@@ -739,7 +735,7 @@ def build_player_press_credit(hazard_model, start_model, source_df, X_source, sl
                 pos_credit_slot[:, i] = np.where(empty, 0.0, pos_credit_slot[:, i] + share_pos_f * orphaned_pos)
                 exec_credit_slot[:, i] = np.where(empty, 0.0, exec_credit_slot[:, i] + share_exec_f * orphaned_exec)
             else:
-                # All slots empty: split pos+exec evenly among participants if available
+                # All slots empty: split evenly among participants
                 sid = seq_ids_ordered[i]
                 pids: list = []
                 if participants is not None:
@@ -764,7 +760,6 @@ def build_player_press_credit(hazard_model, start_model, source_df, X_source, sl
     if n_all_empty > 0 and verify_conservation:
         tqdm.write(f"  [verify] all-empty sequences: {n_all_empty}, dropped pos={dropped_pos:.6f}, exec={dropped_exec:.6f}")
 
-    # Conservation check 2: after reallocation, slot + participant should match seq totals
     if verify_conservation:
         slot_pos_sum = pos_credit_slot.sum()
         slot_exec_sum = exec_credit_slot.sum()

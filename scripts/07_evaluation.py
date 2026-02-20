@@ -2,7 +2,7 @@
 """Evaluation: calibration diagnostics and benchmarking.
 
 1. Calibration (out-of-sample): start model + hazard model reliability diagrams.
-2. Benchmark (TODO): participation, distance, modeling against each other.
+2. Benchmark: participation, distance, modeling against each other.
 """
 
 from __future__ import annotations

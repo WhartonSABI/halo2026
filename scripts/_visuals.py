@@ -599,16 +599,16 @@ def plot_start_frame_positioning(seq_id: int) -> None:
     import numpy as np
     import pandas as pd
 
-    DOT_SIZE = 250  # <-- uniform size for all players
+    DOT_SIZE = 250  # Uniform size for all players
     TRACKING_COLUMNS = [
-    "fc_sequence_id",
-    "sl_event_id",
-    "team_id",
-    "player_id",
-    "tracking_x",
-    "tracking_y",
-    "tracking_vel_x",
-    "tracking_vel_y",
+        "fc_sequence_id",
+        "sl_event_id",
+        "team_id",
+        "player_id",
+        "tracking_x",
+        "tracking_y",
+        "tracking_vel_x",
+        "tracking_vel_y",
     ]  
 
     # ----------------------------

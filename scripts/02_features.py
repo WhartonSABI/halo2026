@@ -25,7 +25,7 @@ PUCK_SPEED_FTPS = 50.0
 DEFENDER_FLOOR_SPEED_FTPS = 8.0
 # Base delay (s) before defender reacts. Scaled down when defender is already closing toward the lane.
 DEFENDER_REACTION_S = 0.10
-# |y| <= this (ft) => "center" lane (up the middle). Boards-side lanes have larger |y|. Arbitrary cutoff.
+# |y| <= this (ft) defines center lane; boards-side lanes have larger |y|
 CENTER_LANE_Y_MAX = 15.0
 MAX_OUTLET_DIST_FILL = 200.0
 
