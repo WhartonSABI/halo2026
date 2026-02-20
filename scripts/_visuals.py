@@ -348,7 +348,6 @@ def save_longest_presses(interval_ms: int = 350) -> None:
         tr = fc_tracking[fc_tracking["fc_sequence_id"] == fc_id]
         _save_press_gif(ev, tr, PLOTS_DIR / f"{name}.gif", title_prefix=title, interval_ms=interval_ms, x_min=-40)
 
-
 #####################################
 ### ATTRIBUTION & CONTRIBUTION EDA ###
 #####################################
@@ -593,6 +592,173 @@ def ranking_comparison_scatter() -> None:
         plt.close()
         print(f"Saved: {out}")
 
+#####################################
+### POSITIONING CONTRIBUTION PLOT ###
+#####################################
+
+def plot_start_frame_positioning(seq_id: int) -> None:
+    import matplotlib.pyplot as plt
+    import numpy as np
+    import pandas as pd
+
+    DOT_SIZE = 250  # <-- uniform size for all players
+    TRACKING_COLUMNS = [
+    "fc_sequence_id",
+    "sl_event_id",
+    "team_id",
+    "player_id",
+    "tracking_x",
+    "tracking_y",
+    "tracking_vel_x",
+    "tracking_vel_y",
+    ]  
+
+    # ----------------------------
+    # Load data
+    # ----------------------------
+    fc_events = pd.read_parquet(PROCESSED_DIR / "forecheck_events.parquet")
+    hazard = pd.read_parquet(PROCESSED_DIR / "hazard_features.parquet")
+    tracking = pd.read_parquet(
+        PROCESSED_DIR / "forecheck_tracking.parquet",
+        columns=TRACKING_COLUMNS
+    )
+
+    ev = fc_events[fc_events["fc_sequence_id"] == seq_id]
+    if len(ev) == 0:
+        print(f"No events for sequence {seq_id}")
+        return
+
+    start_event_id = ev["sl_event_id"].min()
+
+    # ----------------------------
+    # Get start hazard row
+    # ----------------------------
+    start_row = hazard[
+        (hazard["fc_sequence_id"] == seq_id) &
+        (hazard["sl_event_id"] == start_event_id)
+    ]
+
+    if len(start_row) == 0:
+        print("No hazard row for start event")
+        return
+
+    start_row = start_row.iloc[0]
+
+    carrier_id = start_row["carrier_id"]
+
+    slot_cols = ["F1_id", "F2_id", "F3_id", "F4_id", "F5_id"]
+    forechecker_ids = [start_row[c] for c in slot_cols if pd.notna(start_row[c])]
+
+    # ----------------------------
+    # Get tracking frame
+    # ----------------------------
+    frame = tracking[
+        (tracking["fc_sequence_id"] == seq_id) &
+        (tracking["sl_event_id"] == start_event_id)
+    ].copy()
+
+    if len(frame) == 0:
+        print("No tracking for start frame")
+        return
+
+    frame["is_forechecker"] = frame["player_id"].isin(forechecker_ids)
+    frame["is_carrier"] = frame["player_id"] == carrier_id
+
+    # ----------------------------
+    # Plot
+    # ----------------------------
+    fig, ax = plt.subplots(figsize=(12, 6))
+    draw_rink(ax)
+
+    # Defenders
+    defenders = frame[~frame["is_forechecker"]]
+    ax.scatter(
+        defenders["tracking_x"],
+        defenders["tracking_y"],
+        s=DOT_SIZE,
+        c="lightgray",
+        edgecolors="black",
+        label="Defending team",
+        zorder=1
+    )
+
+    # Forecheckers
+    fore = frame[frame["is_forechecker"]]
+    ax.scatter(
+        fore["tracking_x"],
+        fore["tracking_y"],
+        s=DOT_SIZE,
+        c="red",
+        edgecolors="black",
+        label="Forechecking team",
+        zorder=3
+    )
+
+    # Carrier (blue dot, same size)
+    carrier = frame[frame["is_carrier"]]
+    if len(carrier) > 0:
+        ax.scatter(
+            carrier["tracking_x"],
+            carrier["tracking_y"],
+            s=DOT_SIZE,
+            c="blue",
+            edgecolors="black",
+            label="Puck carrier",
+            zorder=5
+        )
+
+    # ----------------------------
+    # Label with positioning score
+    # ----------------------------
+    for _, r in fore.iterrows():
+
+        pid = r["player_id"]
+
+        # Identify which F slot this player is
+        slot_index = None
+        for i in range(1, 6):
+            if start_row[f"F{i}_id"] == pid:
+                slot_index = i
+                break
+
+        if slot_index is None:
+            continue
+
+        score = start_row.get(f"F{slot_index}_block_severity", np.nan)
+
+        # Radial offset away from carrier
+        dx = r["tracking_x"] - start_row["carrier_x"]
+        dy = r["tracking_y"] - start_row["carrier_y"]
+        norm = np.hypot(dx, dy)
+
+        if norm < 1e-6:
+            offset_x, offset_y = 6, 6
+        else:
+            offset_x = 6 * dx / norm
+            offset_y = 6 * dy / norm
+
+        ax.text(
+            r["tracking_x"] + offset_x,
+            r["tracking_y"] + offset_y,
+            f"{score:.2f}",
+            fontsize=10,
+            weight="bold",
+            ha="center",
+            va="center",
+            zorder=6
+        )
+
+    ax.set_title(f"Forecheck Start Snapshot — Sequence {seq_id}")
+    ax.legend()
+    plt.tight_layout()
+
+    PLOTS_DIR.mkdir(parents=True, exist_ok=True)
+    out = PLOTS_DIR / f"start_frame_seq_{seq_id}.png"
+    plt.savefig(out, dpi=150)
+    plt.close()
+
+    print(f"Saved: {out}")
+
 
 def main() -> None:
     import argparse
@@ -606,11 +772,12 @@ def main() -> None:
     parser.add_argument("--rankings", action="store_true", help="Top player bar charts")
     parser.add_argument("--player-press", action="store_true", help="Possession-level credit stats")
     parser.add_argument("--scatter", action="store_true", help="Modeling vs participation/distance scatter")
+    parser.add_argument("--snapshot", type=int, help="Plot start-frame positioning for a sequence")
     args = parser.parse_args()
 
     run_all = args.all or not any([
         args.possession, args.gifs, args.slot_audit, args.spreads,
-        args.distributions, args.rankings, args.player_press, args.scatter,
+        args.distributions, args.rankings, args.player_press, args.scatter, args.snapshot,
     ])
 
     if run_all or args.possession:
@@ -629,6 +796,10 @@ def main() -> None:
         player_press_distributions()
     if run_all or args.scatter:
         ranking_comparison_scatter()
+    if run_all or args.snapshot:
+        forechecks = pd.read_parquet(PROCESSED_DIR / "forechecks.parquet")
+        seq_id = forechecks["fc_sequence_id"].iloc[12244]
+        plot_start_frame_positioning(seq_id)
 
 
 if __name__ == "__main__":
