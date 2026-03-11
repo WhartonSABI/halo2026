@@ -186,6 +186,8 @@ def run_benchmark() -> None:
         ("participation", RESULTS_DIR / "participation.csv", "total", "n_press"),
         ("distance", RESULTS_DIR / "distance.csv", "total", "n_press"),
         ("modeling", RESULTS_DIR / "modeling.csv", "check_total", "n_press"),
+        ("modeling_rfcde", RESULTS_DIR / "rfcde_ghosts" / "modeling.csv", "check_total", "n_press"),
+        ("modeling_rfcde_dist", RESULTS_DIR / "rfcde_distributional" / "modeling.csv", "check_total", "n_press"),
     ]:
         if not path.exists():
             continue
