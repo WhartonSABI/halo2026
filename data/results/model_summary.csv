@@ -1,2 +1,2 @@
-model,start_model,hazard_model,hazard_log_loss
-hybrid,p0_xgb,xgboost,0.13382752144963433
+model,start_model,hazard_model,hazard_log_loss,ghost_method,allocation_method,ghost_draws
+hybrid,p0_xgb,xgboost,0.13382752144963433,rfcde,ghost_shares,10
