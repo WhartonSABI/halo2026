@@ -9,13 +9,15 @@ Pipeline:
 Crediting:
 - Positioning total = p₀ - p̄ (deviation from population avg).
 - Execution total = outcome - p₀ (surprise vs start expectation).
-- Allocation uses RFCDE ghost shares only (distributional Monte Carlo over ghost draws).
+- Allocation supports ghost shares (default), distributional ghost shares, and optional Shapley.
 """
 
 from __future__ import annotations
 
 import argparse
 import ast
+import itertools
+import math
 import os
 import sys
 import warnings
@@ -518,6 +520,109 @@ def _delta_to_share(delta: np.ndarray, total: np.ndarray, eps: float, n_slots: i
     )
 
 
+def _rf_multi_slot_replacement(X_filled, X_raw, slots_to_ghost, slot_predictors, is_start_row, replace_start_only=False):
+    """Replace multiple slots with ghost draws. Slots in slots_to_ghost get ghosted; others stay observed."""
+    cf = X_filled.copy()
+    for slot in slots_to_ghost:
+        if slot not in slot_predictors:
+            continue
+        cf, _ = _rf_slot_replacement(cf, X_raw, slot, slot_predictors[slot], is_start_row, replace_start_only)
+    return cf
+
+
+def _shapley_weight(s: int, n: int) -> float:
+    """Weight w(s)=s!(n-s-1)!/n! for marginal contribution of joining coalition size s."""
+    if s < 0 or s >= n:
+        return 0.0
+    return math.factorial(s) * math.factorial(n - s - 1) / math.factorial(n)
+
+
+def _shapley_values_from_v(v_cache: dict, slots: list[str]) -> dict[str, float]:
+    """Compute Shapley values from precomputed v(S) for all subsets."""
+    n = len(slots)
+    phi = {s: 0.0 for s in slots}
+    for slot_i in slots:
+        others = [s for s in slots if s != slot_i]
+        for r in range(len(others) + 1):
+            for combo in itertools.combinations(others, r):
+                S = frozenset(combo)
+                S_union_i = S | {slot_i}
+                marginal = v_cache.get(S_union_i, 0.0) - v_cache.get(S, 0.0)
+                phi[slot_i] += _shapley_weight(len(S), n) * marginal
+    return phi
+
+
+def _shapley_compute_v_for_subset(args):
+    """Worker: compute v_pos(S) and v_exec(S) for one subset S."""
+    (
+        S, hazard_model, start_model, source_df, X_base, X_source, slot_predictors,
+        slot_names, seq_ids_ordered, start_row_idx_ordered, is_start_row, ghost_draws
+    ) = args
+    n_seq = len(seq_ids_ordered)
+    slots_to_ghost = [s for s in slot_names if s not in S]
+    if not slots_to_ghost:
+        X_use = X_base
+        X_start = X_use.loc[start_row_idx_ordered]
+        v_pos = float(start_model.predict_proba(X_start)[:, 1].mean())
+        proba = hazard_model.predict_proba(X_use)
+        cif_df = _compute_cif_exec(proba, source_df, is_start_row)
+        cif_aligned = cif_df.set_index("fc_sequence_id").reindex(seq_ids_ordered).fillna(0)
+        v_exec = float((cif_aligned["cif_success"].values - cif_aligned["cif_failure"].values).mean())
+        return (S, v_pos, v_exec)
+
+    acc_pos = np.zeros(n_seq)
+    acc_exec = np.zeros(n_seq)
+    for _ in range(ghost_draws):
+        X_cf = _rf_multi_slot_replacement(
+            X_base, X_source, slots_to_ghost, slot_predictors, is_start_row, replace_start_only=False
+        )
+        X_start = X_cf.loc[start_row_idx_ordered]
+        acc_pos += start_model.predict_proba(X_start)[:, 1]
+        proba = hazard_model.predict_proba(X_cf)
+        cif_df = _compute_cif_exec(proba, source_df, is_start_row)
+        cif_aligned = cif_df.set_index("fc_sequence_id").reindex(seq_ids_ordered).fillna(0)
+        acc_exec += cif_aligned["cif_success"].values - cif_aligned["cif_failure"].values
+    return (S, float(acc_pos.mean() / ghost_draws), float(acc_exec.mean() / ghost_draws))
+
+
+def _compute_shapley_slot_values(
+    hazard_model, start_model, source_df, X_base, X_source, slot_predictors,
+    slot_names, seq_ids_ordered, start_row_idx_ordered, is_start_row, ghost_draws
+):
+    """Compute Shapley φ_pos and φ_exec for slots. Parallelizes over all subsets."""
+    subsets = [frozenset(combo) for r in range(len(slot_names) + 1) for combo in itertools.combinations(slot_names, r)]
+    task_args = [
+        (
+            S, hazard_model, start_model, source_df, X_base, X_source, slot_predictors,
+            slot_names, seq_ids_ordered, start_row_idx_ordered, is_start_row, ghost_draws
+        )
+        for S in subsets
+    ]
+    n_workers = min(N_JOBS, len(subsets))
+    v_pos_cache = {}
+    v_exec_cache = {}
+    try:
+        with ProcessPoolExecutor(max_workers=n_workers) as ex:
+            for S, v_pos, v_exec in tqdm(
+                ex.map(_shapley_compute_v_for_subset, task_args, chunksize=1),
+                total=len(subsets),
+                desc="  Shapley v(S)",
+                unit="subset",
+                leave=False,
+                file=sys.stdout,
+            ):
+                v_pos_cache[S] = v_pos
+                v_exec_cache[S] = v_exec
+    except (PermissionError, OSError) as e:
+        tqdm.write(f"  Process pool unavailable ({type(e).__name__}); running Shapley subsets sequentially.")
+        for args in tqdm(task_args, total=len(task_args), desc="  Shapley v(S)", unit="subset", leave=False, file=sys.stdout):
+            S, v_pos, v_exec = _shapley_compute_v_for_subset(args)
+            v_pos_cache[S] = v_pos
+            v_exec_cache[S] = v_exec
+
+    return _shapley_values_from_v(v_pos_cache, slot_names), _shapley_values_from_v(v_exec_cache, slot_names)
+
+
 # Sentinel values for uninvolved slots (player not in frame = further back).
 # Conservative values avoid inflating p₀ when RF extrapolates from 5v5.
 UNINVOLVED_SENTINEL = {
@@ -674,8 +779,9 @@ def build_player_press_credit(hazard_model, start_model, source_df, X_source, sl
                               save_per_press_path=None, verify_conservation: bool = True,
                               participants: pd.DataFrame | None = None,
                               ghost_draws: int = DEFAULT_GHOST_DRAWS,
-                              distributional: bool = False):
-    """Crediting: positioning total=p₀-p̄, exec total=outcome-p₀. Allocate by RFCDE ghost shares.
+                              distributional: bool = False,
+                              use_shapley: bool = False):
+    """Crediting: positioning total=p₀-p̄, exec total=outcome-p₀. Allocate by ghost shares or Shapley.
 
     p₀ = start model predicted P(success) on the start row of each sequence (X_base, sentinel-filled).
     p̄ = mean(outcome) over all sequences.
@@ -714,72 +820,93 @@ def build_player_press_credit(hazard_model, start_model, source_df, X_source, sl
     pos_total = p0 - p_bar
     exec_total = outcome - p0
 
-    mode = "distributional ghost shares" if distributional else "ghost shares"
-    tqdm.write(f"  Crediting {n_slots} slots (p₀-p̄ positioning, outcome-p₀ exec, {mode}, draws={ghost_draws})...")
-    slot_tasks = [(r, s) for r, s in enumerate(slot_names)]
-    task_args = [
-        (
-            r, s, hazard_model, start_model, source_df, X_source, X_base,
-            slot_predictors, base_start_val, base_exec_cif, start_index, is_start_row,
-            start_row_idx_ordered, ghost_draws, distributional
+    if use_shapley:
+        tqdm.write(f"  Crediting {n_slots} slots (p₀-p̄ positioning, outcome-p₀ exec, Shapley shares, draws={ghost_draws})...")
+        phi_pos, phi_exec = _compute_shapley_slot_values(
+            hazard_model, start_model, source_df, X_base, X_source, slot_predictors,
+            slot_names, seq_ids_ordered, start_row_idx_ordered, is_start_row, ghost_draws
         )
-        for r, s in slot_tasks
-    ]
-    slot_results = [None] * len(slot_tasks)
-    n_workers = min(N_JOBS, len(slot_tasks))
-    try:
-        with ProcessPoolExecutor(max_workers=n_workers) as ex:
-            future_to_idx = {ex.submit(_credit_one_slot, *args): i for i, args in enumerate(task_args)}
-            for future in tqdm(as_completed(future_to_idx), total=len(future_to_idx),
-                               desc="  Slots", unit="slot", leave=False, file=sys.stdout):
-                idx = future_to_idx[future]
-                slot_results[idx] = future.result()
-    except (PermissionError, OSError) as e:
-        tqdm.write(f"  Process pool unavailable ({type(e).__name__}); running slot deltas sequentially.")
-        for idx, args in enumerate(tqdm(
-            task_args,
-            total=len(task_args),
-            desc="  Slots",
-            unit="slot",
-            leave=False,
-            file=sys.stdout,
-        )):
-            slot_results[idx] = _credit_one_slot(*args)
-
-    delta_pos = np.zeros((n_slots, n_seq))
-    delta_exec = np.zeros((n_slots, n_seq))
-    if distributional:
-        delta_pos_draws = np.zeros((n_slots, ghost_draws, n_seq))
-        delta_exec_draws = np.zeros((n_slots, ghost_draws, n_seq))
-    for res in slot_results:
-        if distributional:
-            slot, seq_ids, dp, de, dpos_draws, dexc_draws = res
-        else:
-            slot, seq_ids, dp, de = res
-        slot_idx = slot_names.index(slot)
-        delta_pos[slot_idx, :] = dp
-        delta_exec[slot_idx, :] = de
-        if distributional:
-            delta_pos_draws[slot_idx, :, :] = dpos_draws
-            delta_exec_draws[slot_idx, :, :] = dexc_draws
-
-    if distributional:
-        pos_credit_slot = np.zeros((n_slots, n_seq))
-        exec_credit_slot = np.zeros((n_slots, n_seq))
-        for b in range(ghost_draws):
-            dpos_b = delta_pos_draws[:, b, :]
-            dexc_b = delta_exec_draws[:, b, :]
-            share_pos_b = _delta_to_share(dpos_b, pos_total, _eps, n_slots)
-            share_exec_b = _delta_to_share(dexc_b, exec_total, _eps, n_slots)
-            pos_credit_slot += share_pos_b * pos_total
-            exec_credit_slot += share_exec_b * exec_total
-        pos_credit_slot /= ghost_draws
-        exec_credit_slot /= ghost_draws
-    else:
-        share_pos = _delta_to_share(delta_pos, pos_total, _eps, n_slots)
-        share_exec = _delta_to_share(delta_exec, exec_total, _eps, n_slots)
+        sum_phi_pos = sum(phi_pos.get(s, 0.0) for s in slot_names)
+        sum_phi_exec = sum(phi_exec.get(s, 0.0) for s in slot_names)
+        share_pos = np.array([
+            phi_pos.get(s, 0.0) / (sum_phi_pos + _eps) if abs(sum_phi_pos) >= _eps else 1.0 / n_slots
+            for s in slot_names
+        ])[:, np.newaxis]
+        share_exec = np.array([
+            phi_exec.get(s, 0.0) / (sum_phi_exec + _eps) if abs(sum_phi_exec) >= _eps else 1.0 / n_slots
+            for s in slot_names
+        ])[:, np.newaxis]
         pos_credit_slot = share_pos * pos_total
         exec_credit_slot = share_exec * exec_total
+        delta_pos = np.broadcast_to(share_pos, (n_slots, n_seq))
+        delta_exec = np.broadcast_to(share_exec, (n_slots, n_seq))
+    else:
+        mode = "distributional ghost shares" if distributional else "ghost shares"
+        tqdm.write(f"  Crediting {n_slots} slots (p₀-p̄ positioning, outcome-p₀ exec, {mode}, draws={ghost_draws})...")
+        slot_tasks = [(r, s) for r, s in enumerate(slot_names)]
+        task_args = [
+            (
+                r, s, hazard_model, start_model, source_df, X_source, X_base,
+                slot_predictors, base_start_val, base_exec_cif, start_index, is_start_row,
+                start_row_idx_ordered, ghost_draws, distributional
+            )
+            for r, s in slot_tasks
+        ]
+        slot_results = [None] * len(slot_tasks)
+        n_workers = min(N_JOBS, len(slot_tasks))
+        try:
+            with ProcessPoolExecutor(max_workers=n_workers) as ex:
+                future_to_idx = {ex.submit(_credit_one_slot, *args): i for i, args in enumerate(task_args)}
+                for future in tqdm(as_completed(future_to_idx), total=len(future_to_idx),
+                                   desc="  Slots", unit="slot", leave=False, file=sys.stdout):
+                    idx = future_to_idx[future]
+                    slot_results[idx] = future.result()
+        except (PermissionError, OSError) as e:
+            tqdm.write(f"  Process pool unavailable ({type(e).__name__}); running slot deltas sequentially.")
+            for idx, args in enumerate(tqdm(
+                task_args,
+                total=len(task_args),
+                desc="  Slots",
+                unit="slot",
+                leave=False,
+                file=sys.stdout,
+            )):
+                slot_results[idx] = _credit_one_slot(*args)
+
+        delta_pos = np.zeros((n_slots, n_seq))
+        delta_exec = np.zeros((n_slots, n_seq))
+        if distributional:
+            delta_pos_draws = np.zeros((n_slots, ghost_draws, n_seq))
+            delta_exec_draws = np.zeros((n_slots, ghost_draws, n_seq))
+        for res in slot_results:
+            if distributional:
+                slot, seq_ids, dp, de, dpos_draws, dexc_draws = res
+            else:
+                slot, seq_ids, dp, de = res
+            slot_idx = slot_names.index(slot)
+            delta_pos[slot_idx, :] = dp
+            delta_exec[slot_idx, :] = de
+            if distributional:
+                delta_pos_draws[slot_idx, :, :] = dpos_draws
+                delta_exec_draws[slot_idx, :, :] = dexc_draws
+
+        if distributional:
+            pos_credit_slot = np.zeros((n_slots, n_seq))
+            exec_credit_slot = np.zeros((n_slots, n_seq))
+            for b in range(ghost_draws):
+                dpos_b = delta_pos_draws[:, b, :]
+                dexc_b = delta_exec_draws[:, b, :]
+                share_pos_b = _delta_to_share(dpos_b, pos_total, _eps, n_slots)
+                share_exec_b = _delta_to_share(dexc_b, exec_total, _eps, n_slots)
+                pos_credit_slot += share_pos_b * pos_total
+                exec_credit_slot += share_exec_b * exec_total
+            pos_credit_slot /= ghost_draws
+            exec_credit_slot /= ghost_draws
+        else:
+            share_pos = _delta_to_share(delta_pos, pos_total, _eps, n_slots)
+            share_exec = _delta_to_share(delta_exec, exec_total, _eps, n_slots)
+            pos_credit_slot = share_pos * pos_total
+            exec_credit_slot = share_exec * exec_total
 
     seq_pos_sum = pos_total.sum()
     seq_exec_sum = exec_total.sum()
@@ -992,6 +1119,7 @@ def main():
         help="Ghost sampler for slot counterfactuals",
     )
     parser.add_argument("--distributional", action="store_true", help="Use draw-wise Monte Carlo distributional allocation")
+    parser.add_argument("--shapley", action="store_true", help="Use Shapley allocation instead of ghost-share allocation")
     parser.add_argument("--ghost-draws", type=int, default=DEFAULT_GHOST_DRAWS, help="Number of RFCDE ghost draws")
     parser.add_argument(
         "--output-subdir",
@@ -1000,6 +1128,8 @@ def main():
         help="Optional subdir under data/{processed,results} for isolated outputs",
     )
     args = parser.parse_args()
+    if args.shapley and args.distributional:
+        raise ValueError("--shapley and --distributional are mutually exclusive")
     out_dir, results_dir = _resolve_output_dirs(args.output_subdir)
     out_dir.mkdir(parents=True, exist_ok=True)
     results_dir.mkdir(parents=True, exist_ok=True)
@@ -1036,13 +1166,18 @@ def main():
     ll = log_loss(y_test_exec, proba_exec, labels=[0, 1, 2])
     tuning_choice = load_best_model_from_tuning()
     best_model_name = tuning_choice[0] if tuning_choice else "xgboost"
+    alloc_method = (
+        "shapley"
+        if args.shapley
+        else ("distributional_ghost_shares" if args.distributional else "ghost_shares")
+    )
     summary = pd.DataFrame([{
         "model": "hybrid",
         "start_model": "p0_xgb" if load_best_start_model_from_tuning() else "xgboost",
         "hazard_model": best_model_name,
         "hazard_log_loss": ll,
         "ghost_method": args.ghost_method,
-        "allocation_method": "distributional_ghost_shares" if args.distributional else "ghost_shares",
+        "allocation_method": alloc_method,
         "ghost_draws": args.ghost_draws,
     }])
     summary.to_csv(results_dir / "model_summary.csv", index=False)
@@ -1065,6 +1200,7 @@ def main():
         participants=participants,
         ghost_draws=args.ghost_draws,
         distributional=args.distributional,
+        use_shapley=args.shapley,
     )
     _write_clean_csv(player_credit, results_dir / "modeling.csv")
     print("\nDone.")
