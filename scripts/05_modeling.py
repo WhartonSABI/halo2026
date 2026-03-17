@@ -520,6 +520,32 @@ def _delta_to_share(delta: np.ndarray, total: np.ndarray, eps: float, n_slots: i
     )
 
 
+def _softmax_delta_to_share(delta: np.ndarray, eps: float, n_slots: int, tau: float) -> np.ndarray:
+    """Map slot deltas to shares using per-sequence softmax over slot axis."""
+    tau_safe = max(float(tau), eps)
+    z = delta / tau_safe
+    z = z - np.max(z, axis=0, keepdims=True)
+    exp_z = np.exp(z)
+    denom = np.sum(exp_z, axis=0, keepdims=True)
+    return np.where(denom >= eps, exp_z / (denom + eps), 1.0 / n_slots)
+
+
+def _compute_slot_shares(
+    delta: np.ndarray,
+    total: np.ndarray,
+    eps: float,
+    n_slots: int,
+    weighting_mode: str,
+    softmax_tau: float,
+) -> np.ndarray:
+    """Map slot deltas to per-sequence shares using the selected weighting rule."""
+    if weighting_mode == "sign_gated":
+        return _delta_to_share(delta, total, eps, n_slots)
+    if weighting_mode == "softmax":
+        return _softmax_delta_to_share(delta, eps, n_slots, softmax_tau)
+    raise ValueError(f"Unknown weighting_mode: {weighting_mode}")
+
+
 def _rf_multi_slot_replacement(X_filled, X_raw, slots_to_ghost, slot_predictors, is_start_row, replace_start_only=False):
     """Replace multiple slots with ghost draws. Slots in slots_to_ghost get ghosted; others stay observed."""
     cf = X_filled.copy()
@@ -780,7 +806,9 @@ def build_player_press_credit(hazard_model, start_model, source_df, X_source, sl
                               participants: pd.DataFrame | None = None,
                               ghost_draws: int = DEFAULT_GHOST_DRAWS,
                               distributional: bool = False,
-                              use_shapley: bool = False):
+                              use_shapley: bool = False,
+                              weighting_mode: str = "sign_gated",
+                              softmax_tau: float = 1.0):
     """Crediting: positioning total=p₀-p̄, exec total=outcome-p₀. Allocate by ghost shares or Shapley.
 
     p₀ = start model predicted P(success) on the start row of each sequence (X_base, sentinel-filled).
@@ -842,6 +870,10 @@ def build_player_press_credit(hazard_model, start_model, source_df, X_source, sl
         delta_exec = np.broadcast_to(share_exec, (n_slots, n_seq))
     else:
         mode = "distributional ghost shares" if distributional else "ghost shares"
+        if weighting_mode == "softmax":
+            mode = f"{mode}, weighting=softmax(tau={softmax_tau:g})"
+        else:
+            mode = f"{mode}, weighting={weighting_mode}"
         tqdm.write(f"  Crediting {n_slots} slots (p₀-p̄ positioning, outcome-p₀ exec, {mode}, draws={ghost_draws})...")
         slot_tasks = [(r, s) for r, s in enumerate(slot_names)]
         task_args = [
@@ -896,15 +928,23 @@ def build_player_press_credit(hazard_model, start_model, source_df, X_source, sl
             for b in range(ghost_draws):
                 dpos_b = delta_pos_draws[:, b, :]
                 dexc_b = delta_exec_draws[:, b, :]
-                share_pos_b = _delta_to_share(dpos_b, pos_total, _eps, n_slots)
-                share_exec_b = _delta_to_share(dexc_b, exec_total, _eps, n_slots)
+                share_pos_b = _compute_slot_shares(
+                    dpos_b, pos_total, _eps, n_slots, weighting_mode, softmax_tau
+                )
+                share_exec_b = _compute_slot_shares(
+                    dexc_b, exec_total, _eps, n_slots, weighting_mode, softmax_tau
+                )
                 pos_credit_slot += share_pos_b * pos_total
                 exec_credit_slot += share_exec_b * exec_total
             pos_credit_slot /= ghost_draws
             exec_credit_slot /= ghost_draws
         else:
-            share_pos = _delta_to_share(delta_pos, pos_total, _eps, n_slots)
-            share_exec = _delta_to_share(delta_exec, exec_total, _eps, n_slots)
+            share_pos = _compute_slot_shares(
+                delta_pos, pos_total, _eps, n_slots, weighting_mode, softmax_tau
+            )
+            share_exec = _compute_slot_shares(
+                delta_exec, exec_total, _eps, n_slots, weighting_mode, softmax_tau
+            )
             pos_credit_slot = share_pos * pos_total
             exec_credit_slot = share_exec * exec_total
 
@@ -1122,6 +1162,18 @@ def main():
     parser.add_argument("--shapley", action="store_true", help="Use Shapley allocation instead of ghost-share allocation")
     parser.add_argument("--ghost-draws", type=int, default=DEFAULT_GHOST_DRAWS, help="Number of RFCDE ghost draws")
     parser.add_argument(
+        "--weighting-mode",
+        choices=["sign_gated", "softmax"],
+        default="sign_gated",
+        help="How ghost slot deltas map to shares (ignored with --shapley)",
+    )
+    parser.add_argument(
+        "--softmax-tau",
+        type=float,
+        default=1.0,
+        help="Softmax temperature for --weighting-mode softmax (lower=sharper)",
+    )
+    parser.add_argument(
         "--output-subdir",
         type=str,
         default="",
@@ -1130,6 +1182,8 @@ def main():
     args = parser.parse_args()
     if args.shapley and args.distributional:
         raise ValueError("--shapley and --distributional are mutually exclusive")
+    if args.softmax_tau <= 0:
+        raise ValueError("--softmax-tau must be > 0")
     out_dir, results_dir = _resolve_output_dirs(args.output_subdir)
     out_dir.mkdir(parents=True, exist_ok=True)
     results_dir.mkdir(parents=True, exist_ok=True)
@@ -1169,7 +1223,9 @@ def main():
     alloc_method = (
         "shapley"
         if args.shapley
-        else ("distributional_ghost_shares" if args.distributional else "ghost_shares")
+        else (
+            f"{'distributional_' if args.distributional else ''}ghost_shares_{args.weighting_mode}"
+        )
     )
     summary = pd.DataFrame([{
         "model": "hybrid",
@@ -1179,6 +1235,8 @@ def main():
         "ghost_method": args.ghost_method,
         "allocation_method": alloc_method,
         "ghost_draws": args.ghost_draws,
+        "weighting_mode": args.weighting_mode,
+        "softmax_tau": args.softmax_tau,
     }])
     summary.to_csv(results_dir / "model_summary.csv", index=False)
     print(f"  Hazard (exec rows): {best_model_name} log_loss={ll:.4f}")
@@ -1190,6 +1248,8 @@ def main():
     print(f"  Fitted: {list(slot_predictors.keys())}, {args.ghost_draws} ghost draws ({args.ghost_method})")
 
     print("\n[5/5] Computing player credits (hybrid: start + hazard exec)...")
+    if not args.shapley:
+        print(f"  Weighting mode: {args.weighting_mode}" + (f" (tau={args.softmax_tau:g})" if args.weighting_mode == "softmax" else ""))
     X_all = df[numeric_cols + cat_cols]
     participants = _load_participants(df)
     if participants is not None:
@@ -1201,6 +1261,8 @@ def main():
         ghost_draws=args.ghost_draws,
         distributional=args.distributional,
         use_shapley=args.shapley,
+        weighting_mode=args.weighting_mode,
+        softmax_tau=args.softmax_tau,
     )
     _write_clean_csv(player_credit, results_dir / "modeling.csv")
     print("\nDone.")

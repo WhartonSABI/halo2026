@@ -1,0 +1,2 @@
+model,start_model,hazard_model,hazard_log_loss,ghost_method,allocation_method,ghost_draws,weighting_mode,softmax_tau
+hybrid,p0_xgb,xgboost,0.13382752144963433,rfcde,ghost_shares_softmax,10,softmax,1.0
