@@ -10,6 +10,7 @@ Ranks by per-press credit (total / n_press) so players are comparable across ice
 Output: ranking.csv with player_id, player_name, n_press, n_rows, and per-method totals/rates/ranks.
 """
 
+import argparse
 from pathlib import Path
 
 import pandas as pd
@@ -37,6 +38,21 @@ def _normalize_n_press(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description="Build combined ranking tables from method outputs.")
+    parser.add_argument(
+        "--min-n-press-filter",
+        type=int,
+        default=20,
+        help="Minimum n_press for ranking-filtered.csv (set <=0 to disable filtered output).",
+    )
+    parser.add_argument(
+        "--filtered-filename",
+        type=str,
+        default="ranking-filtered.csv",
+        help="Filename for filtered ranking output under data/results/.",
+    )
+    args = parser.parse_args()
+
     dfs = []
     if (RESULTS / "participation.csv").exists():
         p = _normalize_n_press(pd.read_csv(RESULTS / "participation.csv"))
@@ -143,6 +159,17 @@ def main() -> None:
     out_path = RESULTS / "ranking.csv"
     ranking.to_csv(out_path, index=False)
     print(f"Saved: {out_path}")
+
+    if args.min_n_press_filter > 0 and "n_press" in ranking.columns:
+        filtered = ranking[ranking["n_press"] >= args.min_n_press_filter].copy().reset_index(drop=True)
+        filtered.insert(0, "filtered_rank", np.arange(1, len(filtered) + 1))
+        filtered_path = RESULTS / args.filtered_filename
+        filtered.to_csv(filtered_path, index=False)
+        print(
+            f"Saved: {filtered_path} "
+            f"(n_press >= {args.min_n_press_filter}, {len(filtered)} of {len(ranking)} rows)"
+        )
+
     print("\nTop 20:")
     print(ranking.head(20).to_string(index=False))
 
