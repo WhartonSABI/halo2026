@@ -8,7 +8,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from joblib import Parallel, delayed
+from joblib import Parallel, delayed, effective_n_jobs
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 PROCESSED_DIR = PROJECT_ROOT / "data" / "processed"
@@ -365,7 +365,7 @@ def build_hazard_rows(max_frames: int | None = None, n_jobs: int = 1) -> pd.Data
         out_records = _process_chunk(rows, tracking_dict, skater_ids)
         out = pd.DataFrame(out_records)
     else:
-        n_chunks = max(1, min(abs(n_jobs), n_rows))
+        n_chunks = max(1, min(effective_n_jobs(n_jobs), n_rows))
         chunk_size = (n_rows + n_chunks - 1) // n_chunks
         chunks = [rows.iloc[i : i + chunk_size] for i in range(0, n_rows, chunk_size)]
         chunk_keys = [set(zip(c["fc_sequence_id"], c["sl_event_id"])) for c in chunks]

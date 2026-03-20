@@ -546,6 +546,18 @@ def _compute_slot_shares(
     raise ValueError(f"Unknown weighting_mode: {weighting_mode}")
 
 
+def _project_deltas_to_total(delta: np.ndarray, total: np.ndarray, n_slots: int) -> np.ndarray:
+    """Project raw slot deltas to exact per-sequence conservation.
+
+    For each sequence j, solve:
+      minimize ||c_j - d_j||_2  subject to  sum_i c_ij = total_j
+    Closed form:
+      c_ij = d_ij + (total_j - sum_i d_ij) / n_slots
+    """
+    correction = (total - np.sum(delta, axis=0)) / max(int(n_slots), 1)
+    return delta + correction[np.newaxis, :]
+
+
 def _rf_multi_slot_replacement(X_filled, X_raw, slots_to_ghost, slot_predictors, is_start_row, replace_start_only=False):
     """Replace multiple slots with ghost draws. Slots in slots_to_ghost get ghosted; others stay observed."""
     cf = X_filled.copy()
@@ -807,7 +819,7 @@ def build_player_press_credit(hazard_model, start_model, source_df, X_source, sl
                               ghost_draws: int = DEFAULT_GHOST_DRAWS,
                               distributional: bool = False,
                               use_shapley: bool = False,
-                              weighting_mode: str = "sign_gated",
+                              weighting_mode: str = "signed_projected",
                               softmax_tau: float = 1.0):
     """Crediting: positioning total=p₀-p̄, exec total=outcome-p₀. Allocate by ghost shares or Shapley.
 
@@ -840,7 +852,21 @@ def build_player_press_credit(hazard_model, start_model, source_df, X_source, sl
     slot_names = [s for s in FORECHECK_SLOTS
                   if f"{s}_id" in source_df.columns and slot_predictors and slot_predictors.get(s)]
     if not slot_names:
-        return pd.DataFrame(columns=["player_id", "n_rows", "n_press", "positioning", "execution", "total", "total_per_press"])
+        empty = pd.DataFrame(columns=["player_id", "n_rows", "n_press", "positioning", "execution", "total", "total_per_press"])
+        diagnostics = {
+            "raw_delta_pos_sum_error": np.nan,
+            "raw_delta_exec_sum_error": np.nan,
+            "raw_delta_total_sum_error": np.nan,
+            "raw_delta_total_mean_abs_seq_error": np.nan,
+            "raw_delta_total_p95_abs_seq_error": np.nan,
+            "post_alloc_pos_residual": np.nan,
+            "post_alloc_exec_residual": np.nan,
+            "post_alloc_total_residual": np.nan,
+            "post_alloc_total_abs_rel_to_abs_true_total": np.nan,
+            "post_alloc_total_mean_abs_seq_residual": np.nan,
+            "post_alloc_total_p95_abs_seq_residual": np.nan,
+        }
+        return empty, diagnostics
 
     n_seq = len(seq_ids_ordered)
     n_slots = len(slot_names)
@@ -872,6 +898,8 @@ def build_player_press_credit(hazard_model, start_model, source_df, X_source, sl
         mode = "distributional ghost shares" if distributional else "ghost shares"
         if weighting_mode == "softmax":
             mode = f"{mode}, weighting=softmax(tau={softmax_tau:g})"
+        elif weighting_mode == "signed_projected":
+            mode = f"{mode}, weighting=signed_projected"
         else:
             mode = f"{mode}, weighting={weighting_mode}"
         tqdm.write(f"  Crediting {n_slots} slots (p₀-p̄ positioning, outcome-p₀ exec, {mode}, draws={ghost_draws})...")
@@ -928,25 +956,47 @@ def build_player_press_credit(hazard_model, start_model, source_df, X_source, sl
             for b in range(ghost_draws):
                 dpos_b = delta_pos_draws[:, b, :]
                 dexc_b = delta_exec_draws[:, b, :]
-                share_pos_b = _compute_slot_shares(
-                    dpos_b, pos_total, _eps, n_slots, weighting_mode, softmax_tau
-                )
-                share_exec_b = _compute_slot_shares(
-                    dexc_b, exec_total, _eps, n_slots, weighting_mode, softmax_tau
-                )
-                pos_credit_slot += share_pos_b * pos_total
-                exec_credit_slot += share_exec_b * exec_total
+                if weighting_mode == "signed_projected":
+                    pos_credit_slot += _project_deltas_to_total(dpos_b, pos_total, n_slots)
+                    exec_credit_slot += _project_deltas_to_total(dexc_b, exec_total, n_slots)
+                else:
+                    share_pos_b = _compute_slot_shares(
+                        dpos_b, pos_total, _eps, n_slots, weighting_mode, softmax_tau
+                    )
+                    share_exec_b = _compute_slot_shares(
+                        dexc_b, exec_total, _eps, n_slots, weighting_mode, softmax_tau
+                    )
+                    pos_credit_slot += share_pos_b * pos_total
+                    exec_credit_slot += share_exec_b * exec_total
             pos_credit_slot /= ghost_draws
             exec_credit_slot /= ghost_draws
         else:
-            share_pos = _compute_slot_shares(
-                delta_pos, pos_total, _eps, n_slots, weighting_mode, softmax_tau
-            )
-            share_exec = _compute_slot_shares(
-                delta_exec, exec_total, _eps, n_slots, weighting_mode, softmax_tau
-            )
-            pos_credit_slot = share_pos * pos_total
-            exec_credit_slot = share_exec * exec_total
+            if weighting_mode == "signed_projected":
+                pos_credit_slot = _project_deltas_to_total(delta_pos, pos_total, n_slots)
+                exec_credit_slot = _project_deltas_to_total(delta_exec, exec_total, n_slots)
+            else:
+                share_pos = _compute_slot_shares(
+                    delta_pos, pos_total, _eps, n_slots, weighting_mode, softmax_tau
+                )
+                share_exec = _compute_slot_shares(
+                    delta_exec, exec_total, _eps, n_slots, weighting_mode, softmax_tau
+                )
+                pos_credit_slot = share_pos * pos_total
+                exec_credit_slot = share_exec * exec_total
+
+    # Diagnostics on raw ghost deltas before any share/projection mapping.
+    raw_pos_sum = np.sum(delta_pos, axis=0)
+    raw_exec_sum = np.sum(delta_exec, axis=0)
+    raw_total_sum = raw_pos_sum + raw_exec_sum
+    true_total = pos_total + exec_total
+    raw_total_err = raw_total_sum - true_total
+    raw_diag = {
+        "raw_delta_pos_sum_error": float((raw_pos_sum - pos_total).sum()),
+        "raw_delta_exec_sum_error": float((raw_exec_sum - exec_total).sum()),
+        "raw_delta_total_sum_error": float((raw_total_err).sum()),
+        "raw_delta_total_mean_abs_seq_error": float(np.mean(np.abs(raw_total_err))),
+        "raw_delta_total_p95_abs_seq_error": float(np.quantile(np.abs(raw_total_err), 0.95)),
+    }
 
     seq_pos_sum = pos_total.sum()
     seq_exec_sum = exec_total.sum()
@@ -1059,14 +1109,26 @@ def build_player_press_credit(hazard_model, start_model, source_df, X_source, sl
                 )
                 exec_credit = exec_i * exec_share
                 total = pos_credit + exec_credit
-                if player_id is not None and (pos_credit != 0 or exec_credit != 0):
+                # Keep zero-credit participations so n_press reflects true involvement,
+                # not only nonzero credited events.
+                if player_id is not None:
                     rows.append({
                         "player_id": player_id, "fc_sequence_id": sid, "slot": slot,
                         "start_positioning_credit": pos_credit, "execution_credit": exec_credit, "total_press_credit": total,
                     })
     rows.extend(participant_rows)
     if not rows:
-        return pd.DataFrame(columns=["player_id", "n_rows", "n_press", "positioning", "execution", "total", "total_per_press"])
+        empty = pd.DataFrame(columns=["player_id", "n_rows", "n_press", "positioning", "execution", "total", "total_per_press"])
+        diagnostics = {
+            **raw_diag,
+            "post_alloc_pos_residual": np.nan,
+            "post_alloc_exec_residual": np.nan,
+            "post_alloc_total_residual": np.nan,
+            "post_alloc_total_abs_rel_to_abs_true_total": np.nan,
+            "post_alloc_total_mean_abs_seq_residual": np.nan,
+            "post_alloc_total_p95_abs_seq_residual": np.nan,
+        }
+        return empty, diagnostics
     per_slot = pd.DataFrame(rows)
     if verify_conservation and len(per_slot) > 0:
         pos_after = per_slot["start_positioning_credit"].sum()
@@ -1078,6 +1140,19 @@ def build_player_press_credit(hazard_model, start_model, source_df, X_source, sl
         )
         total_exec = exec_per_slot["exec"].sum()
         tqdm.write(f"  SUM(exec) = {total_exec:.6f}  (should be ≈0: outcome - p₀ by construction)")
+    per_seq_alloc = (
+        per_slot.groupby("fc_sequence_id", as_index=False).agg(
+            pos=("start_positioning_credit", "sum"),
+            exec=("execution_credit", "sum"),
+        )
+        .set_index("fc_sequence_id")
+        .reindex(seq_ids_ordered)
+        .fillna(0.0)
+    )
+    per_seq_total_residual = (
+        (per_seq_alloc["pos"].to_numpy() + per_seq_alloc["exec"].to_numpy())
+        - (pos_total + exec_total)
+    )
     per_press = per_slot.groupby(["player_id", "fc_sequence_id"], as_index=False).agg(
         positioning=("start_positioning_credit", "sum"),
         execution=("execution_credit", "sum"),
@@ -1118,12 +1193,30 @@ def build_player_press_credit(hazard_model, start_model, source_df, X_source, sl
     summary["execution"] = summary["execution"].fillna(0)
     summary["check_total"] = summary["positioning"] + summary["execution"]
     summary["check_per_press"] = np.where(summary["n_press"] > 0, summary["check_total"] / summary["n_press"], np.nan)
+    post_alloc_pos_residual = float(summary["positioning"].sum() - seq_pos_sum)
+    post_alloc_exec_residual = float(summary["execution"].sum() - seq_exec_sum)
+    post_alloc_total_residual = float(summary["check_total"].sum() - (seq_pos_sum + seq_exec_sum))
+    abs_true_total = float(np.sum(np.abs(pos_total + exec_total)))
+    post_alloc_total_abs_rel = (
+        float(abs(post_alloc_total_residual) / (abs_true_total + 1e-12))
+        if np.isfinite(abs_true_total)
+        else np.nan
+    )
     if verify_conservation and len(summary) > 0:
         final_pos = summary["positioning"].sum()
         final_exec = summary["execution"].sum()
         final_check = summary["check_total"].sum()
         tqdm.write(f"  [verify] final player sums: pos={final_pos:.6f}, exec={final_exec:.6f}, check={final_check:.6f}")
-    return summary.sort_values("check_per_press", ascending=False).reset_index(drop=True)
+    diagnostics = {
+        **raw_diag,
+        "post_alloc_pos_residual": post_alloc_pos_residual,
+        "post_alloc_exec_residual": post_alloc_exec_residual,
+        "post_alloc_total_residual": post_alloc_total_residual,
+        "post_alloc_total_abs_rel_to_abs_true_total": post_alloc_total_abs_rel,
+        "post_alloc_total_mean_abs_seq_residual": float(np.mean(np.abs(per_seq_total_residual))),
+        "post_alloc_total_p95_abs_seq_residual": float(np.quantile(np.abs(per_seq_total_residual), 0.95)),
+    }
+    return summary.sort_values("check_per_press", ascending=False).reset_index(drop=True), diagnostics
 
 
 def _write_clean_csv(credit, out_path):
@@ -1163,9 +1256,9 @@ def main():
     parser.add_argument("--ghost-draws", type=int, default=DEFAULT_GHOST_DRAWS, help="Number of RFCDE ghost draws")
     parser.add_argument(
         "--weighting-mode",
-        choices=["sign_gated", "softmax"],
-        default="sign_gated",
-        help="How ghost slot deltas map to shares (ignored with --shapley)",
+        choices=["sign_gated", "softmax", "signed_projected"],
+        default="signed_projected",
+        help="How ghost slot deltas are converted into slot credit (ignored with --shapley)",
     )
     parser.add_argument(
         "--softmax-tau",
@@ -1227,7 +1320,7 @@ def main():
             f"{'distributional_' if args.distributional else ''}ghost_shares_{args.weighting_mode}"
         )
     )
-    summary = pd.DataFrame([{
+    summary_row = {
         "model": "hybrid",
         "start_model": "p0_xgb" if load_best_start_model_from_tuning() else "xgboost",
         "hazard_model": best_model_name,
@@ -1237,8 +1330,7 @@ def main():
         "ghost_draws": args.ghost_draws,
         "weighting_mode": args.weighting_mode,
         "softmax_tau": args.softmax_tau,
-    }])
-    summary.to_csv(results_dir / "model_summary.csv", index=False)
+    }
     print(f"  Hazard (exec rows): {best_model_name} log_loss={ll:.4f}")
 
     print("\n[4/5] Fitting slot predictors...")
@@ -1254,7 +1346,7 @@ def main():
     participants = _load_participants(df)
     if participants is not None:
         tqdm.write(f"  Loaded participants for {len(participants):,} sequences (fallback when all slots empty)")
-    player_credit = build_player_press_credit(
+    player_credit, credit_diag = build_player_press_credit(
         hazard_pipe, start_pipe, df, X_all, slot_predictors,
         save_per_press_path=out_dir / "player_press.parquet",
         participants=participants,
@@ -1264,6 +1356,9 @@ def main():
         weighting_mode=args.weighting_mode,
         softmax_tau=args.softmax_tau,
     )
+    summary_row.update(credit_diag)
+    summary = pd.DataFrame([summary_row])
+    summary.to_csv(results_dir / "model_summary.csv", index=False)
     _write_clean_csv(player_credit, results_dir / "modeling.csv")
     print("\nDone.")
     print(f"  Saved: {results_dir / 'model_summary.csv'}, {results_dir / 'modeling.csv'}")

@@ -92,7 +92,7 @@ raw/
        │   total = seq_success - avg                         │
        │   weight by 1/r to carrier                          ├── start model (p₀) + hazard (exec rows)
        │   F1..F5 tracked; unseen get fallback               ├── slot RF predictors (ghosts)
-       │                                                     ├── credit: p₀−p̄, outcome−p₀; allocate by ghost shares
+       │                                                     ├── credit: p₀−p̄, outcome−p₀; allocate by signed-projected ghost shares
        ▼                                                     ▼
 participation.csv, distance.csv                    modeling.csv (player_press.parquet in processed/)
        │                                                     │
@@ -134,7 +134,7 @@ Paths are relative to `scripts/` and `data/` (`raw/`, `processed/`, `results/`).
 | 02 | Per-frame hazard features: carrier, F1..F5 positions/angles, outlets, controls |
 | 03 | Participation (equal split) + distance (1/r weighted); both terminal-moment only |
 | 04 | Tune rf, hist_gbm, xgboost; pick best by test log loss *(optional)* |
-| 05 | Hybrid: start model (p₀) + hazard (exec). Credit: p₀−p̄ and outcome−p₀ via ghost shares |
+| 05 | Hybrid: start model (p₀) + hazard (exec). Credit: p₀−p̄ and outcome−p₀ via signed-projected ghost allocation (default) |
 | 06 | Merge ranks, output composite |
 | 07 | Calibration diagrams (start + hazard), prediction benchmark |
 | _visuals | EDA plots in `plots/` |
@@ -147,7 +147,7 @@ All three methods credit on the full dataset. Each player gets `n_press` (number
 |--------|------------------|------------|
 | **Participation** | total_recovery = success - avg(success) | Equal split among pressing-team skaters on ice at terminal (from stints) |
 | **Distance** | Same | Weight by 1/distance to carrier at terminal; F1..F5 use tracking; unseen get fallback |
-| **Modeling** | Hybrid: p₀−p̄ (positioning) + outcome−p₀ (exec) | Ghost shares for allocation; stint attribution |
+| **Modeling** | Hybrid: p₀−p̄ (positioning) + outcome−p₀ (exec) | Signed-projected ghost allocation (default; optional `sign_gated` / `softmax`); stint attribution |
 
 **Consistency:** Participation uses forechecks + stints. Distance and modeling use hazard features (terminal row vs all rows). All cover the same forecheck sequences. Modeling uses stint-based attribution when slot occupants change mid-sequence (~84% of sequences).
 

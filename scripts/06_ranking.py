@@ -28,32 +28,46 @@ def _per_press_col(df: pd.DataFrame, total_col: str, n_press_col: str = "n_press
     return df[total_col]
 
 
+def _normalize_n_press(df: pd.DataFrame) -> pd.DataFrame:
+    """Normalize n_press column name across source files."""
+    out = df.copy()
+    if "n_presses" in out.columns and "n_press" not in out.columns:
+        out = out.rename(columns={"n_presses": "n_press"})
+    return out
+
+
 def main() -> None:
     dfs = []
     if (RESULTS / "participation.csv").exists():
-        p = pd.read_csv(RESULTS / "participation.csv")
-        if "n_presses" in p.columns and "n_press" not in p.columns:
-            p = p.rename(columns={"n_presses": "n_press"})
+        p = _normalize_n_press(pd.read_csv(RESULTS / "participation.csv"))
         p["per_press"] = _per_press_col(p, "total")
         p["rank_participation"] = p["per_press"].rank(ascending=False, method="min", na_option="bottom")
         cols = ["player_id", "total", "per_press", "rank_participation"]
         if "n_press" in p.columns:
             cols.insert(1, "n_press")
         dfs.append(("participation", p[[c for c in cols if c in p.columns]].rename(
-            columns={"total": "participation_total", "per_press": "participation_per_press", "rank_participation": "participation_rank"})))
+            columns={
+                "n_press": "n_press_participation",
+                "total": "participation_total",
+                "per_press": "participation_per_press",
+                "rank_participation": "participation_rank",
+            })))
     if (RESULTS / "distance.csv").exists():
-        d = pd.read_csv(RESULTS / "distance.csv")
-        if "n_presses" in d.columns and "n_press" not in d.columns:
-            d = d.rename(columns={"n_presses": "n_press"})
+        d = _normalize_n_press(pd.read_csv(RESULTS / "distance.csv"))
         d["per_press"] = _per_press_col(d, "total")
         d["rank_distance"] = d["per_press"].rank(ascending=False, method="min", na_option="bottom")
         cols = ["player_id", "total", "per_press", "rank_distance"]
         if "n_press" in d.columns:
             cols.insert(1, "n_press")
         dfs.append(("distance", d[[c for c in cols if c in d.columns]].rename(
-            columns={"total": "distance_total", "per_press": "distance_per_press", "rank_distance": "distance_rank"})))
+            columns={
+                "n_press": "n_press_distance",
+                "total": "distance_total",
+                "per_press": "distance_per_press",
+                "rank_distance": "distance_rank",
+            })))
     if (RESULTS / "modeling.csv").exists():
-        m = pd.read_csv(RESULTS / "modeling.csv")
+        m = _normalize_n_press(pd.read_csv(RESULTS / "modeling.csv"))
         total_col = "check_total" if "check_total" in m.columns else "total_check"
         per_col = "check_per_press" if "check_per_press" in m.columns else None
         if per_col and per_col in m.columns:
@@ -67,7 +81,12 @@ def main() -> None:
         if "n_rows" in m.columns:
             cols.insert(2, "n_rows")
         dfs.append(("modeling", m[[c for c in cols if c in m.columns]].rename(
-            columns={total_col: "check_total", "per_press": "check_per_press", "rank_model": "check_rank"})))
+            columns={
+                "n_press": "n_press_modeling",
+                total_col: "check_total",
+                "per_press": "check_per_press",
+                "rank_model": "check_rank",
+            })))
 
     if not dfs:
         print("No result CSVs found. Run 03_simple-attribution and 05_modeling first.")
@@ -77,10 +96,11 @@ def main() -> None:
     for _, df in dfs[1:]:
         merged = merged.merge(df, on="player_id", how="outer")
 
-    n_press_cols = [c for c in merged.columns if c == "n_press" or c.startswith("n_press_")]
-    if n_press_cols:
-        merged["n_press"] = merged[n_press_cols].bfill(axis=1).iloc[:, 0]
-        merged = merged.drop(columns=[c for c in n_press_cols if c != "n_press"], errors="ignore")
+    # Prefer modeling press counts when available, then participation, then distance.
+    n_press_priority = [c for c in ["n_press_modeling", "n_press_participation", "n_press_distance"] if c in merged.columns]
+    if n_press_priority:
+        merged["n_press"] = merged[n_press_priority].bfill(axis=1).iloc[:, 0]
+        merged = merged.drop(columns=n_press_priority, errors="ignore")
 
     for path in [RESULTS / "participation.csv", RESULTS / "distance.csv", RESULTS / "modeling.csv"]:
         if path.exists():
@@ -102,6 +122,8 @@ def main() -> None:
     # Exclude goalkeepers from final ranking
     if "position" in merged.columns:
         merged = merged[merged["position"] != "G"]
+    if "n_rows" in merged.columns:
+        merged["n_rows"] = merged["n_rows"].fillna(0).astype(int)
 
     order = [
         "player_id", "player_name", "n_press", "n_rows",
