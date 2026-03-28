@@ -814,7 +814,7 @@ def _load_participants(source_df: pd.DataFrame) -> pd.DataFrame | None:
 
 
 def build_player_press_credit(hazard_model, start_model, source_df, X_source, slot_predictors,
-                              save_per_press_path=None, verify_conservation: bool = True,
+                              save_per_forecheck_path=None, verify_conservation: bool = True,
                               participants: pd.DataFrame | None = None,
                               ghost_draws: int = DEFAULT_GHOST_DRAWS,
                               distributional: bool = False,
@@ -852,7 +852,7 @@ def build_player_press_credit(hazard_model, start_model, source_df, X_source, sl
     slot_names = [s for s in FORECHECK_SLOTS
                   if f"{s}_id" in source_df.columns and slot_predictors and slot_predictors.get(s)]
     if not slot_names:
-        empty = pd.DataFrame(columns=["player_id", "n_rows", "n_press", "positioning", "execution", "total", "total_per_press"])
+        empty = pd.DataFrame(columns=["player_id", "n_rows", "n_forechecks", "positioning", "execution", "total", "total_per_forecheck"])
         diagnostics = {
             "raw_delta_pos_sum_error": np.nan,
             "raw_delta_exec_sum_error": np.nan,
@@ -1109,7 +1109,7 @@ def build_player_press_credit(hazard_model, start_model, source_df, X_source, sl
                 )
                 exec_credit = exec_i * exec_share
                 total = pos_credit + exec_credit
-                # Keep zero-credit participations so n_press reflects true involvement,
+                # Keep zero-credit participations so n_forechecks reflects true involvement,
                 # not only nonzero credited events.
                 if player_id is not None:
                     rows.append({
@@ -1118,7 +1118,7 @@ def build_player_press_credit(hazard_model, start_model, source_df, X_source, sl
                     })
     rows.extend(participant_rows)
     if not rows:
-        empty = pd.DataFrame(columns=["player_id", "n_rows", "n_press", "positioning", "execution", "total", "total_per_press"])
+        empty = pd.DataFrame(columns=["player_id", "n_rows", "n_forechecks", "positioning", "execution", "total", "total_per_forecheck"])
         diagnostics = {
             **raw_diag,
             "post_alloc_pos_residual": np.nan,
@@ -1153,29 +1153,29 @@ def build_player_press_credit(hazard_model, start_model, source_df, X_source, sl
         (per_seq_alloc["pos"].to_numpy() + per_seq_alloc["exec"].to_numpy())
         - (pos_total + exec_total)
     )
-    per_press = per_slot.groupby(["player_id", "fc_sequence_id"], as_index=False).agg(
+    per_forecheck_press = per_slot.groupby(["player_id", "fc_sequence_id"], as_index=False).agg(
         positioning=("start_positioning_credit", "sum"),
         execution=("execution_credit", "sum"),
-        total_in_press=("total_press_credit", "sum"),
+        press_in_forecheck=("total_press_credit", "sum"),
     )
-    if save_per_press_path:
-        per_press.to_parquet(save_per_press_path, index=False)
-        tqdm.write(f"  Saved player_press to {save_per_press_path}")
-    if len(per_press) > 0:
-        n_press_per_player = per_press.groupby("player_id").size()
-        per_press_with_n = per_press.copy()
-        per_press_with_n["player_n_press"] = per_press_with_n["player_id"].map(n_press_per_player)
-        for col, name in [("positioning", "pos"), ("execution", "exec"), ("total_in_press", "total")]:
-            s = per_press[col].dropna()
+    if save_per_forecheck_path:
+        per_forecheck_press.to_parquet(save_per_forecheck_path, index=False)
+        tqdm.write(f"  Saved player_press to {save_per_forecheck_path}")
+    if len(per_forecheck_press) > 0:
+        n_forechecks_per_player = per_forecheck_press.groupby("player_id").size()
+        per_forecheck_with_n = per_forecheck_press.copy()
+        per_forecheck_with_n["player_n_forechecks"] = per_forecheck_with_n["player_id"].map(n_forechecks_per_player)
+        for col, name in [("positioning", "pos"), ("execution", "exec"), ("press_in_forecheck", "press")]:
+            s = per_forecheck_press[col].dropna()
             if len(s) > 0:
-                tqdm.write(f"  {name} (possession): mean={s.mean():.4f}, median={s.median():.4f}, pct_pos={100*(s>0).mean():.1f}%, n={len(s):,}")
-        high = per_press_with_n["player_n_press"] > 10
+                tqdm.write(f"  {name} (forecheck): mean={s.mean():.4f}, median={s.median():.4f}, pct_pos={100*(s>0).mean():.1f}%, n={len(s):,}")
+        high = per_forecheck_with_n["player_n_forechecks"] > 10
         if high.sum() > 0:
-            tqdm.write(f"  exec from high-n (n_press>10): n={high.sum():,}, pct_pos={100*(per_press_with_n.loc[high,'execution']>0).mean():.1f}%")
-        low = per_press_with_n["player_n_press"] <= 10
+            tqdm.write(f"  exec from high-n (n_forechecks>10): n={high.sum():,}, pct_pos={100*(per_forecheck_with_n.loc[high,'execution']>0).mean():.1f}%")
+        low = per_forecheck_with_n["player_n_forechecks"] <= 10
         if low.sum() > 0:
-            tqdm.write(f"  exec from low-n (n_press<=10): n={low.sum():,}, pct_pos={100*(per_press_with_n.loc[low,'execution']>0).mean():.1f}%")
-        ex = per_press["execution"]
+            tqdm.write(f"  exec from low-n (n_forechecks<=10): n={low.sum():,}, pct_pos={100*(per_forecheck_with_n.loc[low,'execution']>0).mean():.1f}%")
+        ex = per_forecheck_press["execution"]
         pos_vals, neg_vals = ex[ex > 0], ex[ex < 0]
         if len(pos_vals) > 0 and len(neg_vals) > 0:
             tqdm.write(f"  exec magnitude: mean(pos)={pos_vals.mean():.4f}, mean(neg)={neg_vals.mean():.4f}")
@@ -1183,19 +1183,19 @@ def build_player_press_credit(hazard_model, start_model, source_df, X_source, sl
     with_idx = source_df[["fc_sequence_id"] + slot_cols].reset_index()
     melted = with_idx.melt(id_vars=["index", "fc_sequence_id"], value_vars=slot_cols, var_name="_", value_name="player_id").dropna(subset=["player_id"])
     n_rows = melted.groupby("player_id")["index"].nunique().reset_index(name="n_rows")
-    summary = per_press.groupby("player_id", as_index=False).agg(
-        n_press=("fc_sequence_id", "nunique"),
+    summary = per_forecheck_press.groupby("player_id", as_index=False).agg(
+        n_forechecks=("fc_sequence_id", "nunique"),
         positioning=("positioning", "sum"),
         execution=("execution", "sum"),
-        total=("total_in_press", "sum"),
+        total=("press_in_forecheck", "sum"),
     )
     summary = summary.merge(n_rows, on="player_id", how="left")
     summary["execution"] = summary["execution"].fillna(0)
-    summary["check_total"] = summary["positioning"] + summary["execution"]
-    summary["check_per_press"] = np.where(summary["n_press"] > 0, summary["check_total"] / summary["n_press"], np.nan)
+    summary["press_total"] = summary["positioning"] + summary["execution"]
+    summary["press_per_forecheck"] = np.where(summary["n_forechecks"] > 0, summary["press_total"] / summary["n_forechecks"], np.nan)
     post_alloc_pos_residual = float(summary["positioning"].sum() - seq_pos_sum)
     post_alloc_exec_residual = float(summary["execution"].sum() - seq_exec_sum)
-    post_alloc_total_residual = float(summary["check_total"].sum() - (seq_pos_sum + seq_exec_sum))
+    post_alloc_total_residual = float(summary["press_total"].sum() - (seq_pos_sum + seq_exec_sum))
     abs_true_total = float(np.sum(np.abs(pos_total + exec_total)))
     post_alloc_total_abs_rel = (
         float(abs(post_alloc_total_residual) / (abs_true_total + 1e-12))
@@ -1205,8 +1205,8 @@ def build_player_press_credit(hazard_model, start_model, source_df, X_source, sl
     if verify_conservation and len(summary) > 0:
         final_pos = summary["positioning"].sum()
         final_exec = summary["execution"].sum()
-        final_check = summary["check_total"].sum()
-        tqdm.write(f"  [verify] final player sums: pos={final_pos:.6f}, exec={final_exec:.6f}, check={final_check:.6f}")
+        final_press = summary["press_total"].sum()
+        tqdm.write(f"  [verify] final player sums: pos={final_pos:.6f}, exec={final_exec:.6f}, press={final_press:.6f}")
     diagnostics = {
         **raw_diag,
         "post_alloc_pos_residual": post_alloc_pos_residual,
@@ -1216,7 +1216,7 @@ def build_player_press_credit(hazard_model, start_model, source_df, X_source, sl
         "post_alloc_total_mean_abs_seq_residual": float(np.mean(np.abs(per_seq_total_residual))),
         "post_alloc_total_p95_abs_seq_residual": float(np.quantile(np.abs(per_seq_total_residual), 0.95)),
     }
-    return summary.sort_values("check_per_press", ascending=False).reset_index(drop=True), diagnostics
+    return summary.sort_values("press_per_forecheck", ascending=False).reset_index(drop=True), diagnostics
 
 
 def _write_clean_csv(credit, out_path):
@@ -1227,13 +1227,13 @@ def _write_clean_csv(credit, out_path):
     merge_cols = {pid_col: "player_id", name_col: "player_name"}
     if pos_col in players_df.columns:
         merge_cols[pos_col] = "position"
-    keep = ["player_id", "n_rows", "n_press", "positioning", "execution", "check_total", "check_per_press"]
+    keep = ["player_id", "n_rows", "n_forechecks", "positioning", "execution", "press_total", "press_per_forecheck"]
     out = credit[[c for c in keep if c in credit.columns]].rename(columns={"positioning": "pos_total", "execution": "exec_total"})
-    out = out.sort_values("check_per_press", ascending=False).merge(
+    out = out.sort_values("press_per_forecheck", ascending=False).merge(
         players_df[[c for c in [pid_col, name_col, pos_col] if c in players_df.columns]].rename(columns=merge_cols),
         on="player_id", how="left",
     )
-    out_cols = ["player_id", "player_name", "position", "n_press", "n_rows", "pos_total", "exec_total", "check_total", "check_per_press"]
+    out_cols = ["player_id", "player_name", "position", "n_forechecks", "n_rows", "pos_total", "exec_total", "press_total", "press_per_forecheck"]
     out = out[[c for c in out_cols if c in out.columns]].copy()
     # Exclude goalkeepers
     if "position" in out.columns:
@@ -1348,7 +1348,7 @@ def main():
         tqdm.write(f"  Loaded participants for {len(participants):,} sequences (fallback when all slots empty)")
     player_credit, credit_diag = build_player_press_credit(
         hazard_pipe, start_pipe, df, X_all, slot_predictors,
-        save_per_press_path=out_dir / "player_press.parquet",
+        save_per_forecheck_path=out_dir / "player_press.parquet",
         participants=participants,
         ghost_draws=args.ghost_draws,
         distributional=args.distributional,

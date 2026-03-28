@@ -212,14 +212,14 @@ def allocate_participation_from_participants(terminal: pd.DataFrame) -> pd.DataF
 
     if not rows:
         return pd.DataFrame(
-            columns=["player_id", "n_press", "total_recovery_value_participation"]
+            columns=["player_id", "n_forechecks", "total_recovery_value_participation"]
         )
 
     out = (
         pd.DataFrame(rows)
         .groupby("player_id", as_index=False)
         .agg(
-            n_press=("fc_sequence_id", "nunique"),
+            n_forechecks=("fc_sequence_id", "nunique"),
             total_recovery_value_participation=("total_recovery_value_alloc", "sum"),
         )
         .sort_values("total_recovery_value_participation", ascending=False)
@@ -249,14 +249,14 @@ def allocate_distance(
 
     if not rows:
         return pd.DataFrame(
-            columns=["player_id", "n_press", "total_recovery_value_distance"]
+            columns=["player_id", "n_forechecks", "total_recovery_value_distance"]
         )
 
     out = (
         pd.DataFrame(rows)
         .groupby("player_id", as_index=False)
         .agg(
-            n_press=("fc_sequence_id", "nunique"),
+            n_forechecks=("fc_sequence_id", "nunique"),
             total_recovery_value_distance=("total_recovery_value_alloc", "sum"),
         )
         .sort_values("total_recovery_value_distance", ascending=False)
@@ -268,9 +268,9 @@ def _write_clean_csv(
     df: pd.DataFrame,
     value_col: str,
     out_path: Path,
-    has_n_press: bool = True,
+    has_n_forechecks: bool = True,
 ) -> None:
-    """Write clean CSV: player_id, player_name, position, n_press?, total."""
+    """Write clean CSV: player_id, player_name, position, n_forechecks?, total."""
     players_df = pd.read_parquet(RAW_DIR / "players.parquet")
     pid_col = "player_id" if "player_id" in players_df.columns else "id"
     name_col = "player_name" if "player_name" in players_df.columns else "name"
@@ -279,21 +279,27 @@ def _write_clean_csv(
     if pos_col in players_df.columns:
         merge_cols[pos_col] = "position"
     cols = ["player_id", value_col]
-    if has_n_press and "n_press" in df.columns:
-        cols.insert(1, "n_press")
+    if "n_press" in df.columns and "n_forechecks" not in df.columns:
+        df = df.rename(columns={"n_press": "n_forechecks"})
+    if "n_presses" in df.columns and "n_forechecks" not in df.columns:
+        df = df.rename(columns={"n_presses": "n_forechecks"})
+    if has_n_forechecks and "n_forechecks" in df.columns:
+        cols.insert(1, "n_forechecks")
     out = df[cols].copy()
     out = out.rename(columns={value_col: "total"})
-    if "n_press" in out.columns:
-        out["total_per_press"] = np.where(out["n_press"] > 0, out["total"] / out["n_press"], np.nan)
+    if "n_forechecks" in out.columns:
+        out["total_per_forecheck"] = np.where(out["n_forechecks"] > 0, out["total"] / out["n_forechecks"], np.nan)
     out = out.sort_values("total", ascending=False).reset_index(drop=True)
     out = out.merge(
         players_df[[c for c in [pid_col, name_col, pos_col] if c in players_df.columns]].rename(columns=merge_cols),
         on="player_id",
         how="left",
     )
-    if "n_presses" in out.columns and "n_press" not in out.columns:
-        out = out.rename(columns={"n_presses": "n_press"})
-    out_cols = ["player_id", "player_name", "position", "n_press", "total", "total_per_press"]
+    if "n_press" in out.columns and "n_forechecks" not in out.columns:
+        out = out.rename(columns={"n_press": "n_forechecks"})
+    if "n_presses" in out.columns and "n_forechecks" not in out.columns:
+        out = out.rename(columns={"n_presses": "n_forechecks"})
+    out_cols = ["player_id", "player_name", "position", "n_forechecks", "total", "total_per_forecheck"]
     out = out[[c for c in out_cols if c in out.columns]]
     out.to_csv(out_path, index=False)
 

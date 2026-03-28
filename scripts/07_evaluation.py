@@ -183,21 +183,25 @@ def run_benchmark() -> None:
 
     method_data = {}
     for name, path, total_col, n_col in [
-        ("participation", RESULTS_DIR / "participation.csv", "total", "n_press"),
-        ("distance", RESULTS_DIR / "distance.csv", "total", "n_press"),
-        ("modeling", RESULTS_DIR / "modeling.csv", "check_total", "n_press"),
-        ("modeling_rfcde", RESULTS_DIR / "rfcde_ghosts" / "modeling.csv", "check_total", "n_press"),
-        ("modeling_rfcde_dist", RESULTS_DIR / "rfcde_distributional" / "modeling.csv", "check_total", "n_press"),
+        ("participation", RESULTS_DIR / "participation.csv", "total", "n_forechecks"),
+        ("distance", RESULTS_DIR / "distance.csv", "total", "n_forechecks"),
+        ("modeling", RESULTS_DIR / "modeling.csv", "press_total", "n_forechecks"),
+        ("modeling_rfcde", RESULTS_DIR / "rfcde_ghosts" / "modeling.csv", "press_total", "n_forechecks"),
+        ("modeling_rfcde_dist", RESULTS_DIR / "rfcde_distributional" / "modeling.csv", "press_total", "n_forechecks"),
     ]:
         if not path.exists():
             continue
         df = pd.read_csv(path)
-        tcol = total_col if total_col in df.columns else "total"
-        ncol = n_col if n_col in df.columns else "n_press"
+        if "n_press" in df.columns and "n_forechecks" not in df.columns:
+            df = df.rename(columns={"n_press": "n_forechecks"})
+        if "n_presses" in df.columns and "n_forechecks" not in df.columns:
+            df = df.rename(columns={"n_presses": "n_forechecks"})
+        tcol = total_col if total_col in df.columns else ("check_total" if "check_total" in df.columns else "total")
+        ncol = n_col if n_col in df.columns else "n_forechecks"
         if tcol not in df.columns or ncol not in df.columns:
             continue
         method_data[name] = df[["player_id", tcol, ncol]].dropna().rename(
-            columns={tcol: "total", ncol: "n_press"}
+            columns={tcol: "total", ncol: "n_forechecks"}
         )
 
     if not method_data:
@@ -219,7 +223,7 @@ def run_benchmark() -> None:
     kfold = GroupKFold(n_splits=5, shuffle=True, random_state=42)
 
     print("\n[Benchmark] 5-fold CV over games (each game in test once)")
-    print("  Turnover success: forecheck-level. Metric = sum(total)/sum(n_press) for players on ice.")
+    print("  Turnover success: forecheck-level. Metric = sum(total)/sum(n_forechecks) for players on ice.")
     print("  Won: team-game level. Mean ± std across folds.")
     print()
 
@@ -233,9 +237,9 @@ def run_benchmark() -> None:
             merged = fc_exp.merge(data, on="player_id", how="inner")
             agg = merged.groupby("fc_sequence_id").agg(
                 total=("total", "sum"),
-                n_press=("n_press", "sum"),
+                n_forechecks=("n_forechecks", "sum"),
             ).reset_index()
-            agg["metric"] = np.where(agg["n_press"] > 0, agg["total"] / agg["n_press"], np.nan)
+            agg["metric"] = np.where(agg["n_forechecks"] > 0, agg["total"] / agg["n_forechecks"], np.nan)
             fc_with_metric = fc.merge(agg[["fc_sequence_id", "metric"]], on="fc_sequence_id", how="inner")
             fc_with_metric = fc_with_metric.dropna(subset=["metric"])
             fc_with_metric = fc_with_metric[fc_with_metric["participant_ids"].apply(len) > 0]
@@ -287,9 +291,9 @@ def run_benchmark() -> None:
         merged = player_team.merge(data, on="player_id", how="inner")
         agg = merged.groupby(["game_id", "team_id"]).agg(
             total=("total", "sum"),
-            n_press=("n_press", "sum"),
+            n_forechecks=("n_forechecks", "sum"),
         ).reset_index()
-        agg[f"{name}_metric"] = np.where(agg["n_press"] > 0, agg["total"] / agg["n_press"], np.nan)
+        agg[f"{name}_metric"] = np.where(agg["n_forechecks"] > 0, agg["total"] / agg["n_forechecks"], np.nan)
         tg = tg.merge(agg[["game_id", "team_id", f"{name}_metric"]], on=["game_id", "team_id"], how="left")
 
     metric_cols = [c for c in tg.columns if c.endswith("_metric")]

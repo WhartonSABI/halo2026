@@ -1,4 +1,4 @@
-Rank,Name,Position,# of presses,POS (pp),EXEC (pp),CHECK (pp)
+Rank,Name,Position,# of forechecks,POS/forecheck,EXEC/forecheck,PRESS/forecheck
 1,"Hall, Curtis",C,51,0.0242,0.0963,0.1205
 2,"Lapierre, Hendrix",C,40,0.0701,0.0444,0.1145
 3,"Anderson, Joey",RW,33,0.0805,0.0323,0.1129

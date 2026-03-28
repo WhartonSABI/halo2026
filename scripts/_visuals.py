@@ -384,8 +384,10 @@ def attribution_spreads() -> None:
     p_path = RESULTS_DIR / "participation.csv"
     if p_path.exists():
         p = pd.read_csv(p_path)
-        if "n_presses" in p.columns and "n_press" not in p.columns:
-            p = p.rename(columns={"n_presses": "n_press"})
+        if "n_presses" in p.columns and "n_forechecks" not in p.columns:
+            p = p.rename(columns={"n_presses": "n_forechecks"})
+        if "n_press" in p.columns and "n_forechecks" not in p.columns:
+            p = p.rename(columns={"n_press": "n_forechecks"})
         col = "total"
         s = p[col].dropna()
         n = len(s)
@@ -397,8 +399,10 @@ def attribution_spreads() -> None:
     d_path = RESULTS_DIR / "distance.csv"
     if d_path.exists():
         d = pd.read_csv(d_path)
-        if "n_presses" in d.columns and "n_press" not in d.columns:
-            d = d.rename(columns={"n_presses": "n_press"})
+        if "n_presses" in d.columns and "n_forechecks" not in d.columns:
+            d = d.rename(columns={"n_presses": "n_forechecks"})
+        if "n_press" in d.columns and "n_forechecks" not in d.columns:
+            d = d.rename(columns={"n_press": "n_forechecks"})
         col = "total"
         s = d[col].dropna()
         n = len(s)
@@ -410,7 +414,7 @@ def attribution_spreads() -> None:
     m_path = RESULTS_DIR / "modeling.csv"
     if m_path.exists():
         m = pd.read_csv(m_path)
-        for col in ["pos_total", "exec_total", "check_total"]:
+        for col in ["pos_total", "exec_total", "press_total", "check_total"]:
             if col not in m.columns:
                 continue
             s = m[col].dropna()
@@ -430,8 +434,9 @@ def contribution_distributions() -> None:
             data_specs.append(("Positioning", m["pos_total"].dropna(), "contrib_positioning.png"))
         if "exec_total" in m.columns:
             data_specs.append(("Execution", m["exec_total"].dropna(), "contrib_execution.png"))
-        if "check_total" in m.columns:
-            data_specs.append(("PRESS", m["check_total"].dropna(), "contrib_press.png"))
+        press_col = "press_total" if "press_total" in m.columns else "check_total"
+        if press_col in m.columns:
+            data_specs.append(("PRESS", m[press_col].dropna(), "contrib_press.png"))
     if not data_specs:
         print("contribution_distributions: need modeling.csv")
         return
@@ -455,16 +460,18 @@ def player_rankings_visual(top_n: int = 20) -> None:
     paths = {
         "participation": (RESULTS_DIR / "participation.csv", "total"),
         "distance": (RESULTS_DIR / "distance.csv", "total"),
-        "PRESS": (RESULTS_DIR / "modeling.csv", "check_total"),
+        "PRESS": (RESULTS_DIR / "modeling.csv", "press_total"),
     }
     dfs = {}
     for name, (p, total_col) in paths.items():
         if p.exists():
             df = pd.read_csv(p)
-            if "n_presses" in df.columns and "n_press" not in df.columns:
-                df = df.rename(columns={"n_presses": "n_press"})
+            if "n_presses" in df.columns and "n_forechecks" not in df.columns:
+                df = df.rename(columns={"n_presses": "n_forechecks"})
+            if "n_press" in df.columns and "n_forechecks" not in df.columns:
+                df = df.rename(columns={"n_press": "n_forechecks"})
             if total_col not in df.columns and name == "PRESS":
-                total_col = "total"
+                total_col = "check_total" if "check_total" in df.columns else "total"
             if total_col in df.columns and "player_name" in df.columns:
                 dfs[name] = df.nlargest(top_n, total_col)[["player_name", total_col]]
 
@@ -503,24 +510,25 @@ def player_rankings_visual(top_n: int = 20) -> None:
 
 
 def player_press_distributions() -> None:
-    """Possession-level spread of pos/exec/total from player_press.parquet."""
+    """Forecheck-level spread of pos/exec/press from player_press.parquet."""
     path = PROCESSED_DIR / "player_press.parquet"
     if not path.exists():
         print("player_press_distributions: data/processed/player_press.parquet not found (run 05_modeling.py)")
         return
 
     pp = pd.read_parquet(path)
+    press_in_forecheck_col = "press_in_forecheck" if "press_in_forecheck" in pp.columns else "total_in_press"
     for col, name in [
         ("positioning", "pos"),
         ("execution", "exec"),
-        ("total_in_press", "total"),
+        (press_in_forecheck_col, "press"),
     ]:
         if col not in pp.columns:
             continue
         s = pp[col].dropna()
         if len(s) == 0:
             continue
-        print(f"\n{name} (possession): mean={s.mean():.4f}, median={s.median():.4f}, "
+        print(f"\n{name} (forecheck): mean={s.mean():.4f}, median={s.median():.4f}, "
               f"pct_pos={100*(s>0).mean():.1f}%, n={len(s):,}")
 
     if "execution" in pp.columns:
@@ -530,17 +538,17 @@ def player_press_distributions() -> None:
         if len(pos_vals) > 0 and len(neg_vals) > 0:
             print(f"\nexec magnitude: mean(pos)={pos_vals.mean():.4f}, mean(neg)={neg_vals.mean():.4f}")
 
-    n_press_per_player = pp.groupby("player_id").size()
+    n_forechecks_per_player = pp.groupby("player_id").size()
     pp = pp.copy()
-    pp["player_n_press"] = pp["player_id"].map(n_press_per_player)
-    high = pp["player_n_press"] > 10
-    low = pp["player_n_press"] <= 10
+    pp["player_n_forechecks"] = pp["player_id"].map(n_forechecks_per_player)
+    high = pp["player_n_forechecks"] > 10
+    low = pp["player_n_forechecks"] <= 10
     if high.sum() > 0:
         sh = pp.loc[high, "execution"]
-        print(f"exec from high-n (n_press>10): n={high.sum():,}, pct_pos={100*(sh>0).mean():.1f}%")
+        print(f"exec from high-n (n_forechecks>10): n={high.sum():,}, pct_pos={100*(sh>0).mean():.1f}%")
     if low.sum() > 0:
         sl = pp.loc[low, "execution"]
-        print(f"exec from low-n (n_press<=10): n={low.sum():,}, pct_pos={100*(sl>0).mean():.1f}%")
+        print(f"exec from low-n (n_forechecks<=10): n={low.sum():,}, pct_pos={100*(sl>0).mean():.1f}%")
 
 
 def ranking_comparison_scatter() -> None:
@@ -555,9 +563,13 @@ def ranking_comparison_scatter() -> None:
         if not p.exists():
             continue
         df = pd.read_csv(p)
-        if "n_presses" in df.columns:
-            df = df.rename(columns={"n_presses": "n_press"})
-        total_col = "check_total" if name == "modeling" and "check_total" in df.columns else "total"
+        if "n_presses" in df.columns and "n_forechecks" not in df.columns:
+            df = df.rename(columns={"n_presses": "n_forechecks"})
+        if "n_press" in df.columns and "n_forechecks" not in df.columns:
+            df = df.rename(columns={"n_press": "n_forechecks"})
+        total_col = "press_total" if name == "modeling" and "press_total" in df.columns else (
+            "check_total" if name == "modeling" and "check_total" in df.columns else "total"
+        )
         if total_col in df.columns:
             dfs[name] = df[["player_id", total_col]].rename(columns={total_col: name})
 
@@ -762,7 +774,7 @@ def team_level_press() -> None:
     """Bar chart of team-level total PRESS (modeling only)."""
     s_path = DATA_DIR / "stints.parquet"
     paths = {
-        "press": (RESULTS_DIR / "modeling.csv", "check_total"),
+        "press": (RESULTS_DIR / "modeling.csv", "press_total"),
     }
     if not s_path.exists():
         print("team_level_press: need stints.parquet")
@@ -775,6 +787,8 @@ def team_level_press() -> None:
         if not p.exists():
             continue
         df = pd.read_csv(p)
+        if total_col not in df.columns and total_col == "press_total":
+            total_col = "check_total"
         if total_col not in df.columns:
             continue
         merged = stints.merge(df[["player_id", total_col]], on="player_id", how="inner")
@@ -824,12 +838,12 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="EDA visuals for forecheck analysis")
     parser.add_argument("--all", action="store_true", help="Run all (default)")
     parser.add_argument("--possession", action="store_true", help="Possession time vs recovery")
-    parser.add_argument("--gifs", action="store_true", help="Save longest press GIFs")
+    parser.add_argument("--gifs", action="store_true", help="Save longest forecheck GIFs")
     parser.add_argument("--slot-audit", action="store_true", help="Slot-change audit")
     parser.add_argument("--spreads", action="store_true", help="Attribution positive/negative spreads")
     parser.add_argument("--distributions", action="store_true", help="Contribution histograms")
     parser.add_argument("--rankings", action="store_true", help="Top player bar charts")
-    parser.add_argument("--player-press", action="store_true", help="Possession-level credit stats")
+    parser.add_argument("--player-press", action="store_true", help="Forecheck-level PRESS credit stats")
     parser.add_argument("--scatter", action="store_true", help="Modeling vs participation/distance scatter")
     parser.add_argument("--team-press", action="store_true", help="Team-level PRESS bar chart")
     args = parser.parse_args()

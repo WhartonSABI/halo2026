@@ -124,7 +124,7 @@ participation.csv, distance.csv                    modeling.csv (player_press.pa
 
 Paths are relative to `scripts/` and `data/` (`raw/`, `processed/`, `results/`). See `data_dictionary.md` for raw schema.
 
-**EDA visuals** (`_visuals.py`): `python scripts/_visuals.py` (default: all) or `--possession`, `--gifs`, `--slot-audit`, `--spreads`, `--distributions`, `--rankings`, `--player-press`, `--scatter`, `--team-check`. Produces slot-change audit, attribution spreads, contribution histograms, player ranking charts, modeling-vs-other scatter, team-level check ability, and press GIFs.
+**EDA visuals** (`_visuals.py`): `python scripts/_visuals.py` (default: all) or `--possession`, `--gifs`, `--slot-audit`, `--spreads`, `--distributions`, `--rankings`, `--player-press`, `--scatter`, `--team-press`. Produces slot-change audit, attribution spreads, contribution histograms, player ranking charts, modeling-vs-other scatter, team-level PRESS summaries, and forecheck GIFs.
 
 ### Step summary
 
@@ -141,7 +141,7 @@ Paths are relative to `scripts/` and `data/` (`raw/`, `processed/`, `results/`).
 
 ### Attribution methods
 
-All three methods credit on the full dataset. Each player gets `n_press` (number of forechecks they participated in) and a total value.
+All three methods credit on the full dataset. Each player gets `n_forechecks` (number of forechecks they participated in) and a total value.
 
 | Method | Value definition | Allocation |
 |--------|------------------|------------|
