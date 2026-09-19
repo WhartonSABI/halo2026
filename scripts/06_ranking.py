@@ -2,12 +2,12 @@
 """Combined forecheck ranking from participation, distance, and modeling outputs.
 
 Merges results from:
-- participation.csv (03_simple-attribution, equal split)
-- distance.csv (03_simple-attribution, distance-weighted)
-- modeling.csv (05_modeling, hazard-model counterfactual credits)
+- participation.csv.gz (03_simple-attribution, equal split)
+- distance.csv.gz (03_simple-attribution, distance-weighted)
+- modeling.csv.gz (05_modeling, hazard-model counterfactual credits)
 
 Ranks by per-forecheck credit so players are comparable across workload.
-Output: ranking.csv with player_id, player_name, n_forechecks, n_rows,
+Output: ranking.csv.gz with player_id, player_name, n_forechecks, n_rows,
 and per-method totals/rates/ranks.
 """
 
@@ -61,7 +61,7 @@ def main() -> None:
         "--min-n-forechecks-filter",
         type=int,
         default=20,
-        help="Minimum n_forechecks for ranking-filtered.csv (set <=0 to disable filtered output).",
+        help="Minimum n_forechecks for ranking-filtered.csv.gz (set <=0 to disable filtered output).",
     )
     parser.add_argument(
         "--min-n-press-filter",
@@ -72,14 +72,14 @@ def main() -> None:
     parser.add_argument(
         "--filtered-filename",
         type=str,
-        default="ranking-filtered.csv",
+        default="ranking-filtered.csv.gz",
         help="Filename for filtered ranking output under data/results/.",
     )
     args = parser.parse_args()
 
     dfs = []
-    if (RESULTS / "participation.csv").exists():
-        p = _normalize_n_forechecks(pd.read_csv(RESULTS / "participation.csv"))
+    if (RESULTS / "participation.csv.gz").exists():
+        p = _normalize_n_forechecks(pd.read_csv(RESULTS / "participation.csv.gz"))
         p["per_forecheck"] = _per_forecheck_col(p, "total")
         p["rank_participation"] = p["per_forecheck"].rank(ascending=False, method="min", na_option="bottom")
         cols = ["player_id", "total", "per_forecheck", "rank_participation"]
@@ -93,8 +93,8 @@ def main() -> None:
                 "rank_participation": "participation_rank",
             })))
 
-    if (RESULTS / "distance.csv").exists():
-        d = _normalize_n_forechecks(pd.read_csv(RESULTS / "distance.csv"))
+    if (RESULTS / "distance.csv.gz").exists():
+        d = _normalize_n_forechecks(pd.read_csv(RESULTS / "distance.csv.gz"))
         d["per_forecheck"] = _per_forecheck_col(d, "total")
         d["rank_distance"] = d["per_forecheck"].rank(ascending=False, method="min", na_option="bottom")
         cols = ["player_id", "total", "per_forecheck", "rank_distance"]
@@ -108,8 +108,8 @@ def main() -> None:
                 "rank_distance": "distance_rank",
             })))
 
-    if (RESULTS / "modeling.csv").exists():
-        m = _normalize_n_forechecks(pd.read_csv(RESULTS / "modeling.csv"))
+    if (RESULTS / "modeling.csv.gz").exists():
+        m = _normalize_n_forechecks(pd.read_csv(RESULTS / "modeling.csv.gz"))
         total_col = _model_total_col(m)
         per_col = _model_rate_col(m)
         if total_col is not None:
@@ -149,7 +149,7 @@ def main() -> None:
     if "n_forechecks" in merged.columns:
         merged["n_forechecks"] = merged["n_forechecks"].astype("Int64")
 
-    for path in [RESULTS / "participation.csv", RESULTS / "distance.csv", RESULTS / "modeling.csv"]:
+    for path in [RESULTS / "participation.csv.gz", RESULTS / "distance.csv.gz", RESULTS / "modeling.csv.gz"]:
         if path.exists():
             src = pd.read_csv(path)
             name_col = next((c for c in src.columns if c in ("player_name", "name")), None)
@@ -186,7 +186,7 @@ def main() -> None:
         na_position="last",
     ).reset_index(drop=True)
 
-    out_path = RESULTS / "ranking.csv"
+    out_path = RESULTS / "ranking.csv.gz"
     ranking.to_csv(out_path, index=False)
     print(f"Saved: {out_path}")
 

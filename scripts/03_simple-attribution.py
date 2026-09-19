@@ -12,8 +12,8 @@ Implements two allocation schemes:
 
 Outputs:
 - data/processed/terminal_recovery_value.parquet
-- data/results/participation.csv
-- data/results/distance.csv
+- data/results/participation.csv.gz
+- data/results/distance.csv.gz
 """
 
 from __future__ import annotations
@@ -326,7 +326,7 @@ def main() -> None:
         distance = allocate_distance(terminal_hazard, participants, skater_ids=skater_ids)
         terminal_path = OUT_DIR / "terminal_recovery_value.parquet"
         terminal_hazard.to_parquet(terminal_path, index=False)
-        dist_path = RESULTS_DIR / "distance.csv"
+        dist_path = RESULTS_DIR / "distance.csv.gz"
         _write_clean_csv(distance, "total_recovery_value_distance", dist_path)
         print(f"Saved: {terminal_path}, {dist_path}")
         print("Top distance credits:")
@@ -334,7 +334,7 @@ def main() -> None:
     except FileNotFoundError:
         print("Skipping distance allocation: hazard_features.parquet not found (run 02_features.py first)")
 
-    part_path = RESULTS_DIR / "participation.csv"
+    part_path = RESULTS_DIR / "participation.csv.gz"
     _write_clean_csv(participation, "total_recovery_value_participation", part_path)
     print(f"Saved: {part_path}")
     print("\nTop participation credits:")

@@ -95,8 +95,8 @@ def split_groups(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
 
 
 def _read_tuning_csv() -> pd.DataFrame | None:
-    """Load tuning results from tuning_quick.csv or tuning_full.csv."""
-    for fname in ("tuning_full.csv", "tuning_quick.csv"):
+    """Load tuning results from tuning_quick.csv.gz or tuning_full.csv.gz."""
+    for fname in ("tuning_full.csv.gz", "tuning_quick.csv.gz"):
         p = RESULTS_DIR / fname
         if p.exists():
             df = pd.read_csv(p)
@@ -1358,10 +1358,10 @@ def main():
     )
     summary_row.update(credit_diag)
     summary = pd.DataFrame([summary_row])
-    summary.to_csv(results_dir / "model_summary.csv", index=False)
-    _write_clean_csv(player_credit, results_dir / "modeling.csv")
+    summary.to_csv(results_dir / "model_summary.csv.gz", index=False)
+    _write_clean_csv(player_credit, results_dir / "modeling.csv.gz")
     print("\nDone.")
-    print(f"  Saved: {results_dir / 'model_summary.csv'}, {results_dir / 'modeling.csv'}")
+    print(f"  Saved: {results_dir / 'model_summary.csv.gz'}, {results_dir / 'modeling.csv.gz'}")
 
 
 if __name__ == "__main__":

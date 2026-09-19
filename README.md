@@ -49,7 +49,7 @@ Quick test with subsample:
 ```
 
 **Outputs:**
-- `data/results/` — `ranking.csv`, `participation.csv`, `distance.csv`, `modeling.csv`
+- `data/results/` — `ranking.csv.gz`, `participation.csv.gz`, `distance.csv.gz`, `modeling.csv.gz`
 - `data/processed/` — `player_press.parquet`
 - `plots/` — calibration, attribution spreads, rankings, scatter, etc.
 
@@ -85,7 +85,7 @@ raw/
 03_simple-attribution                                  04_tuning (optional)
        │                                                     │
        ├── participation (stints only)                       ▼
-       │   total = seq_success - avg                  tuning_quick.csv / tuning_full.csv
+       │   total = seq_success - avg                  tuning_quick.csv.gz / tuning_full.csv.gz
        │   equal split among on-ice skaters                  │
        │                                                     ▼
        ├── distance (terminal frame only)             05_modeling
@@ -94,11 +94,11 @@ raw/
        │   F1..F5 tracked; unseen get fallback               ├── slot RF predictors (ghosts)
        │                                                     ├── credit: p₀−p̄, outcome−p₀; allocate by signed-projected ghost shares
        ▼                                                     ▼
-participation.csv, distance.csv                    modeling.csv (player_press.parquet in processed/)
+participation.csv.gz, distance.csv.gz                    modeling.csv.gz (player_press.parquet in processed/)
        │                                                     │
        └───────────────────────────┬─────────────────────────┘
                                   ▼
-                           06_ranking ──► ranking.csv (composite rank)
+                           06_ranking ──► ranking.csv.gz (composite rank)
                                   │
                                   ▼
                            07_evaluation ──► calibration plots, benchmark (start + hazard)
@@ -115,10 +115,10 @@ participation.csv, distance.csv                    modeling.csv (player_press.pa
 |------|--------|--------|---------|
 | 1 | `01_forechecks.py` | `events.parquet`, `tracking.parquet` | `forechecks.parquet`, `forecheck_events.parquet`, `forecheck_tracking.parquet` |
 | 2 | `02_features.py` | processed forecheck data, raw | `hazard_features.parquet` |
-| 3 | `03_simple-attribution.py` | forechecks, hazard features, raw | `terminal_recovery_value.parquet`, `participation.csv`, `distance.csv` |
-| 4 | `04_tuning.py` | `hazard_features.parquet` | `tuning_quick.csv` or `tuning_full.csv` *(optional)* |
-| 5 | `05_modeling.py` | `hazard_features.parquet` | `modeling.csv`, `model_summary.csv`; `processed/player_press.parquet` |
-| 6 | `06_ranking.py` | participation, distance, modeling | `ranking.csv` (composite rank) |
+| 3 | `03_simple-attribution.py` | forechecks, hazard features, raw | `terminal_recovery_value.parquet`, `participation.csv.gz`, `distance.csv.gz` |
+| 4 | `04_tuning.py` | `hazard_features.parquet` | `tuning_quick.csv.gz` or `tuning_full.csv.gz` *(optional)* |
+| 5 | `05_modeling.py` | `hazard_features.parquet` | `modeling.csv.gz`, `model_summary.csv.gz`; `processed/player_press.parquet` |
+| 6 | `06_ranking.py` | participation, distance, modeling | `ranking.csv.gz` (composite rank) |
 | 7 | `07_evaluation.py` | hazard_features, modeling | Calibration plots (`plots/`), benchmark results |
 | — | `_visuals.py` | results CSVs | `plots/` — possession, spreads, rankings, scatter, etc. |
 
@@ -171,7 +171,7 @@ Sequences are built by `01_forechecks.py`: each starts with a dump-in and the de
 
 ## Model tuning
 
-**Tuning** (`scripts/04_tuning.py`) tunes RandomForest, HistGradientBoosting, and XGBoost. When `tuning_quick.csv` or `tuning_full.csv` exists, `05_modeling.py` uses that best model. Otherwise run tuning first.
+**Tuning** (`scripts/04_tuning.py`) tunes RandomForest, HistGradientBoosting, and XGBoost. When `tuning_quick.csv.gz` or `tuning_full.csv.gz` exists, `05_modeling.py` uses that best model. Otherwise run tuning first.
 
 - **Method:** `RandomizedSearchCV` with group-based cross-validation (`GroupKFold` on `fc_sequence_id`) to avoid sequence leakage
 - **Metric:** log loss (3-class: ongoing, success, failure)

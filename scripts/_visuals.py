@@ -43,7 +43,7 @@ BLUE_LINE = 25
 def load_events(data_dir: Path) -> pd.DataFrame:
     """Load events from parquet or CSV."""
     pq = data_dir / "events.parquet"
-    csv = JP_DIR / "events.csv"
+    csv = JP_DIR / "events.csv.gz"
     if pq.exists():
         return pd.read_parquet(pq)
     if csv.exists():
@@ -57,7 +57,7 @@ def load_events(data_dir: Path) -> pd.DataFrame:
 def load_tracking(data_dir: Path) -> pd.DataFrame:
     """Load tracking from parquet or CSV."""
     pq = data_dir / "tracking.parquet"
-    csv = JP_DIR / "tracking.csv"
+    csv = JP_DIR / "tracking.csv.gz"
     if pq.exists():
         return pd.read_parquet(pq)
     if csv.exists():
@@ -381,7 +381,7 @@ def attribution_spreads() -> None:
     print("\n--- Attribution spreads ---")
 
     # Participation
-    p_path = RESULTS_DIR / "participation.csv"
+    p_path = RESULTS_DIR / "participation.csv.gz"
     if p_path.exists():
         p = pd.read_csv(p_path)
         if "n_presses" in p.columns and "n_forechecks" not in p.columns:
@@ -396,7 +396,7 @@ def attribution_spreads() -> None:
             print(f"\nParticipation ({col}): + {100*pos/n:.1f}% ({pos:,}) | - {100*neg/n:.1f}% ({neg:,}) | 0 {100*zero/n:.1f}%")
 
     # Distance
-    d_path = RESULTS_DIR / "distance.csv"
+    d_path = RESULTS_DIR / "distance.csv.gz"
     if d_path.exists():
         d = pd.read_csv(d_path)
         if "n_presses" in d.columns and "n_forechecks" not in d.columns:
@@ -411,7 +411,7 @@ def attribution_spreads() -> None:
             print(f"Distance ({col}): + {100*pos/n:.1f}% ({pos:,}) | - {100*neg/n:.1f}% ({neg:,}) | 0 {100*zero/n:.1f}%")
 
     # Modeling
-    m_path = RESULTS_DIR / "modeling.csv"
+    m_path = RESULTS_DIR / "modeling.csv.gz"
     if m_path.exists():
         m = pd.read_csv(m_path)
         for col in ["pos_total", "exec_total", "press_total", "check_total"]:
@@ -427,7 +427,7 @@ def attribution_spreads() -> None:
 def contribution_distributions() -> None:
     """Histograms: save Positioning, Execution, PRESS as separate PNGs for stacking in LaTeX."""
     data_specs = []
-    m_path = RESULTS_DIR / "modeling.csv"
+    m_path = RESULTS_DIR / "modeling.csv.gz"
     if m_path.exists():
         m = pd.read_csv(m_path)
         if "pos_total" in m.columns:
@@ -438,7 +438,7 @@ def contribution_distributions() -> None:
         if press_col in m.columns:
             data_specs.append(("PRESS", m[press_col].dropna(), "contrib_press.png"))
     if not data_specs:
-        print("contribution_distributions: need modeling.csv")
+        print("contribution_distributions: need modeling.csv.gz")
         return
 
     PLOTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -458,9 +458,9 @@ def contribution_distributions() -> None:
 def player_rankings_visual(top_n: int = 20) -> None:
     """Bar charts of top players by each attribution method."""
     paths = {
-        "participation": (RESULTS_DIR / "participation.csv", "total"),
-        "distance": (RESULTS_DIR / "distance.csv", "total"),
-        "PRESS": (RESULTS_DIR / "modeling.csv", "press_total"),
+        "participation": (RESULTS_DIR / "participation.csv.gz", "total"),
+        "distance": (RESULTS_DIR / "distance.csv.gz", "total"),
+        "PRESS": (RESULTS_DIR / "modeling.csv.gz", "press_total"),
     }
     dfs = {}
     for name, (p, total_col) in paths.items():
@@ -554,9 +554,9 @@ def player_press_distributions() -> None:
 def ranking_comparison_scatter() -> None:
     """Scatter: model vs participation, model vs distance, distance vs participation."""
     paths = {
-        "participation": RESULTS_DIR / "participation.csv",
-        "distance": RESULTS_DIR / "distance.csv",
-        "modeling": RESULTS_DIR / "modeling.csv",
+        "participation": RESULTS_DIR / "participation.csv.gz",
+        "distance": RESULTS_DIR / "distance.csv.gz",
+        "modeling": RESULTS_DIR / "modeling.csv.gz",
     }
     dfs = {}
     for name, p in paths.items():
@@ -774,7 +774,7 @@ def team_level_press() -> None:
     """Bar chart of team-level total PRESS (modeling only)."""
     s_path = DATA_DIR / "stints.parquet"
     paths = {
-        "press": (RESULTS_DIR / "modeling.csv", "press_total"),
+        "press": (RESULTS_DIR / "modeling.csv.gz", "press_total"),
     }
     if not s_path.exists():
         print("team_level_press: need stints.parquet")

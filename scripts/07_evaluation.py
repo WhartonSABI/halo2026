@@ -183,11 +183,11 @@ def run_benchmark() -> None:
 
     method_data = {}
     for name, path, total_col, n_col in [
-        ("participation", RESULTS_DIR / "participation.csv", "total", "n_forechecks"),
-        ("distance", RESULTS_DIR / "distance.csv", "total", "n_forechecks"),
-        ("modeling", RESULTS_DIR / "modeling.csv", "press_total", "n_forechecks"),
-        ("modeling_rfcde", RESULTS_DIR / "rfcde_ghosts" / "modeling.csv", "press_total", "n_forechecks"),
-        ("modeling_rfcde_dist", RESULTS_DIR / "rfcde_distributional" / "modeling.csv", "press_total", "n_forechecks"),
+        ("participation", RESULTS_DIR / "participation.csv.gz", "total", "n_forechecks"),
+        ("distance", RESULTS_DIR / "distance.csv.gz", "total", "n_forechecks"),
+        ("modeling", RESULTS_DIR / "modeling.csv.gz", "press_total", "n_forechecks"),
+        ("modeling_rfcde", RESULTS_DIR / "rfcde_ghosts" / "modeling.csv.gz", "press_total", "n_forechecks"),
+        ("modeling_rfcde_dist", RESULTS_DIR / "rfcde_distributional" / "modeling.csv.gz", "press_total", "n_forechecks"),
     ]:
         if not path.exists():
             continue

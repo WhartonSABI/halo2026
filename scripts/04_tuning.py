@@ -329,7 +329,7 @@ def main() -> None:
         print(f"\nBest hazard: {best_name} (test log_loss={best_loss:.5f})")
 
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-    out_filename = "tuning_full.csv" if args.full else "tuning_quick.csv"
+    out_filename = "tuning_full.csv.gz" if args.full else "tuning_quick.csv.gz"
     out_path = RESULTS_DIR / out_filename
     results_df.to_csv(out_path, index=False)
     print(f"\np₀ (start) params saved in {out_path} (model=p0_xgb)")
